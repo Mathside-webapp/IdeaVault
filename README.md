@@ -55,7 +55,9 @@ The canonical editable source is in `src/`; generated browser fallback lives in 
 4. When the workflow successfully completes, open its run page and download **IdeaVault-Android-Debug-APK** under **Artifacts**.
 5. Unzip that artifact and install `app-debug.apk` on your Android phone. Android may ask permission to install from that source.
 
-The GitHub runner has Java, Node, Android SDK, and Gradle; you do **not** need Android Studio on your own computer for the CI workflow. The CI workflow runs `npm install`, verifies tests, builds the offline web bundle, generates the Capacitor Android folder, adds packaged custom launcher and notification icons, and invokes Gradle `assembleDebug`.
+The workflow checks GitHub's preinstalled Android SDK, instead of invoking the older third-party SDK installation action. It configures API 36/Build Tools 36 only when necessary. The GitHub runner has Java, Node, Android SDK, and Gradle; you do **not** need Android Studio on your own computer for the CI workflow. The CI workflow runs `npm install`, verifies tests, builds the offline web bundle, generates the Capacitor Android folder, adds packaged custom launcher and notification icons, and invokes Gradle `assembleDebug`.
+
+**Troubleshooting:** If an older repository workflow fails at "Install Android SDK tools", replace `.github/workflows/build-android.yml` with the version in this archive, commit it to the default branch, and run the workflow again. If the new workflow fails, inspect the final error lines of the failed step.
 
 **This project archive does not contain an already compiled APK**. The workflow has been prepared but has not run in your own GitHub account. Debug APKs are development installers, not signed Play Store release builds.
 
