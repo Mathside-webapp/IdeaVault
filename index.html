@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=5, user-scalable=yes" />
+  <meta name="theme-color" content="#f4eee1" />
+  <meta name="description" content="IdeaVault — your thoughts, beautifully connected." />
+  <link rel="icon" type="image/svg+xml" href="/assets/icon.svg" />
+  <title>IdeaVault — A home for every thought</title>
+</head>
+<body>
+<div id="app" class="app-shell">
+  <aside class="sidebar" id="sidebar">
+    <a class="brand" href="#todo" aria-label="IdeaVault home">
+      <span class="brand-mark"><span class="brand-paper"></span><span class="brand-pin"></span></span>
+      <span><strong>ideavault<span class="brand-dot">.</span></strong><small>make room for ideas</small></span>
+    </a>
+    <div class="side-section-label">YOUR WORKSPACE</div>
+    <nav class="side-nav" aria-label="Main navigation">
+      <button data-nav="todo" class="nav-link active"><span data-icon="check-square"></span><span>To-do board</span><span class="nav-count" id="todoCount">0</span></button>
+      <button data-nav="ideas" class="nav-link"><span data-icon="lightbulb"></span><span>Ideas board</span><span class="nav-count" id="ideasCount">0</span></button>
+      <div class="nav-divider"></div>
+      <button data-nav="search" class="nav-link"><span data-icon="search"></span><span>Search notes</span></button>
+      <button data-nav="archive" class="nav-link"><span data-icon="archive"></span><span>Archive & trash</span></button>
+      <button data-nav="settings" class="nav-link"><span data-icon="settings"></span><span>Preferences</span></button>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="side-card"><span class="side-card-icon" data-icon="sparkles"></span><strong>Small thoughts. Big things.</strong><p>Every brilliant idea begins with a single note.</p></div>
+      <div class="offline-indicator"><span class="offline-dot"></span> Stored on this device <span data-icon="shield-check"></span></div>
+    </div>
+  </aside>
+  <div class="main-panel">
+    <header class="topbar">
+      <div class="topbar-left"><span class="topbar-kicker" id="viewKicker">YOUR SPACE / 01</span><h1 id="viewTitle">To-do board <span class="title-accent">✳</span></h1><p class="view-subtitle" id="viewSubtitle">A little order for everything on your mind.</p></div>
+      <div class="topbar-actions"><span class="today-pill" id="datePill"></span><button class="icon-button" data-action="help" aria-label="How to use IdeaVault" title="How to use IdeaVault"><span data-icon="circle-help"></span></button><button class="avatar-button" data-nav="settings" aria-label="Open settings">IV</button></div>
+    </header>
+    <section class="board-view" id="boardView" aria-label="Interactive corkboard">
+      <div class="board-toolbar">
+        <div class="tool-left"><span class="tool-caption">TOOLS</span><div class="tool-group" aria-label="Corkboard tools"><button class="tool-button selected" data-tool="select" title="Move notes" aria-label="Move notes"><span data-icon="mouse-pointer-2"></span><span class="tool-label">Move</span></button><button class="tool-button" data-tool="pan" title="Pan around board" aria-label="Pan around board"><span data-icon="hand"></span><span class="tool-label">Pan</span></button><button class="tool-button" data-tool="connect" title="Connect note pins" aria-label="Connect note pins"><span data-icon="git-branch"></span><span class="tool-label">Connect</span></button></div><select id="connectionKind" class="kind-select" title="Connection type" aria-label="Connection type"><option value="related">Related</option><option value="dependency">Depends on</option></select></div>
+        <div class="tool-right"><button class="text-tool desktop-only" data-action="export-png"><span data-icon="image-down"></span>Export PNG</button><div class="zoom-control"><button data-action="zoom-out" aria-label="Zoom out"><span data-icon="minus"></span></button><button class="zoom-label" id="zoomLabel" data-action="reset-view" title="Reset view">100%</button><button data-action="zoom-in" aria-label="Zoom in"><span data-icon="plus"></span></button></div><button class="icon-button board-options" data-action="board-menu" aria-label="Board options"><span data-icon="ellipsis"></span></button></div>
+      </div>
+      <div class="frame-wrap"><div id="boardViewport" class="board-viewport" aria-label="Drag notes on the corkboard. Double tap to create."><div id="boardWorld" class="board-world"><svg id="stringsLayer" class="strings-layer" width="8000" height="6000" viewBox="0 0 8000 6000" aria-label="Note connections"></svg><div id="notesLayer" class="notes-layer"></div></div><div id="boardEmpty" class="empty-board hidden"><div class="empty-sketch"><span data-icon="sticky-note"></span><span data-icon="move-up-right"></span></div><h2>A blank board, full of possibilities.</h2><p>Start with a note. Move it around. Connect it to another.</p><button class="primary-button" data-action="add-note"><span data-icon="plus"></span>Create your first note</button></div></div></div>
+      <div class="board-footer"><div class="board-stats" id="boardStats">0 notes · 0 connections</div><div class="board-hint" id="boardHint"><span data-icon="mouse-pointer-2"></span> Drag notes to arrange · Double-click anywhere to add</div></div>
+      <button id="addNoteFab" class="fab" data-action="add-note" title="Add note"><span data-icon="plus"></span><span>Add note</span></button>
+      <button id="cancelConnect" class="connect-banner hidden" data-action="cancel-connect"><span data-icon="git-branch"></span><span id="connectBannerText">Choose a pin</span><b>Cancel ×</b></button>
+    </section>
+    <section id="listView" class="list-view hidden"></section>
+  </div>
+  <nav class="mobile-nav" aria-label="Mobile navigation"><button data-nav="todo" class="active"><span data-icon="check-square"></span>Tasks</button><button data-nav="ideas"><span data-icon="lightbulb"></span>Ideas</button><button data-nav="search"><span data-icon="search"></span>Search</button><button data-nav="archive"><span data-icon="archive"></span>Archive</button><button data-nav="settings"><span data-icon="settings"></span>Settings</button></nav>
+</div>
+<div id="modalRoot"></div><div id="toastRoot" aria-live="polite"></div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

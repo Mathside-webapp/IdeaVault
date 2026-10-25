@@ -1,0 +1,7 @@
+{
+  "appId": "com.ideavault.corkboard",
+  "appName": "IdeaVault",
+  "webDir": "dist",
+  "android": { "backgroundColor": "#e8dac0", "allowMixedContent": false },
+  "plugins": { "LocalNotifications": { "smallIcon": "ic_stat_ideavault", "iconColor": "#BE5542" } }
+}

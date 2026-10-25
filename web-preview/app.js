@@ -1,0 +1,547 @@
+/* IdeaVault standalone offline browser build. Android version uses the Capacitor native module. */
+'use strict';
+
+
+/* storage.js */
+const db = (()=> {
+const DB_NAME = 'ideavault-local';
+const DB_VERSION = 2;
+let dbPromise;
+function openDb() {
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('notes')) db.createObjectStore('notes', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('links')) db.createObjectStore('links', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('boards')) db.createObjectStore('boards', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('attachments')) {
+        const store = db.createObjectStore('attachments', { keyPath: 'id' });
+        store.createIndex('noteId', 'noteId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains('preferences')) db.createObjectStore('preferences', { keyPath: 'key' });
+      if (!db.objectStoreNames.contains('sections')) db.createObjectStore('sections', { keyPath: 'id' });
+    };
+    req.onsuccess = () => { const db = req.result; db.onversionchange = () => { db.close(); dbPromise = null; }; resolve(db); };
+    req.onerror = () => { dbPromise = null; reject(req.error); };
+    req.onblocked = () => reject(new Error('Close other IdeaVault tabs before upgrading storage.'));
+  });
+  return dbPromise;
+}
+async function transaction(stores, mode, callback) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(stores, mode);
+    let result;
+    try { result = callback(tx); } catch (error) { tx.abort(); reject(error); return; }
+    tx.oncomplete = () => resolve(result);
+    tx.onerror = () => reject(tx.error || new Error('Local storage failed.'));
+    tx.onabort = () => reject(tx.error || new Error('Local storage aborted.'));
+  });
+}
+async function getAll(store) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function getOne(store, key) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(store, 'readonly').objectStore(store).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+const put = (store, row) => transaction([store], 'readwrite', tx => tx.objectStore(store).put(row));
+const remove = (store, key) => transaction([store], 'readwrite', tx => tx.objectStore(store).delete(key));
+async function replaceCore({ notes, links, boards, sections = [] }) {
+  await transaction(['notes', 'links', 'boards', 'sections'], 'readwrite', tx => {
+    for (const name of ['notes', 'links', 'boards', 'sections']) {
+      const store = tx.objectStore(name);
+      store.clear();
+      for (const row of ({ notes, links, boards, sections })[name]) store.put(row);
+    }
+  });
+}
+async function restoreAll(data) {
+  await transaction(['notes','links','boards','attachments','preferences','sections'], 'readwrite', tx => {
+    for (const name of ['notes','links','boards','attachments','preferences','sections']) {
+      const store = tx.objectStore(name);
+      store.clear();
+      for (const row of (data[name] || [])) store.put(row);
+    }
+  });
+}
+async function getNoteFiles(noteId) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction('attachments', 'readonly').objectStore('attachments').index('noteId').getAll(noteId);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function deletePermanently(noteId) {
+  const files = await getNoteFiles(noteId);
+  await transaction(['notes','attachments'], 'readwrite', tx => {
+    tx.objectStore('notes').delete(noteId);
+    for (const f of files) tx.objectStore('attachments').delete(f.id);
+  });
+}
+async function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
+}
+function base64ToBlob(base64, type) {
+  const binary = atob(base64);
+  const chunks = [];
+  for (let i = 0; i < binary.length; i += 8192) {
+    const section = binary.slice(i, i + 8192);
+    const array = new Uint8Array(section.length);
+    for (let j = 0; j < section.length; j++) array[j] = section.charCodeAt(j);
+    chunks.push(array);
+  }
+  return new Blob(chunks, { type: type || 'application/octet-stream' });
+}
+
+return {DB_NAME,DB_VERSION,openDb,transaction,getAll,getOne,put,remove,replaceCore,restoreAll,getNoteFiles,deletePermanently,blobToBase64,base64ToBlob};
+})();
+
+/* geometry.js */
+let WORLD_W = 8000;
+let WORLD_H = 6000;
+function ensureWorldSpace(x, y, width = 300, height = 300) {
+  let expanded = false;
+  while (x + width + 550 > WORLD_W) { WORLD_W += 2000; expanded = true; }
+  while (y + height + 550 > WORLD_H) { WORLD_H += 1500; expanded = true; }
+  return expanded;
+}
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+function worldPoint(clientX, clientY, rect, board) {
+  return { x: (clientX - rect.left - board.ox) / board.zoom, y: (clientY - rect.top - board.oy) / board.zoom };
+}
+function pinPosition(note) { return { x: note.x + note.w / 2, y: note.y + 17 }; }
+function stringPath(a, b) {
+  const p = pinPosition(a), q = pinPosition(b);
+  const d = Math.hypot(q.x - p.x, q.y - p.y);
+  const sag = Math.min(34, Math.max(9, d * .07));
+  return `M ${p.x} ${p.y} Q ${(p.x + q.x) / 2} ${(p.y + q.y) / 2 + sag} ${q.x} ${q.y}`;
+}
+function zoomAround(board, newZoom, clientX, clientY, rect) {
+  const z = clamp(newZoom, .35, 2.25);
+  const localX = clientX - rect.left;
+  const localY = clientY - rect.top;
+  const wx = (localX - board.ox) / board.zoom;
+  const wy = (localY - board.oy) / board.zoom;
+  board.ox = localX - wx * z;
+  board.oy = localY - wy * z;
+  board.zoom = z;
+}
+function allowedLink(links, boardId, from, to, kind) {
+  return from !== to && !links.some(e => e.boardId === boardId && ((e.from === from && e.to === to) || (e.from === to && e.to === from)));
+}
+
+
+/* icons.js */
+const paths = {
+'check-square':'<rect x="3" y="3" width="18" height="18" rx="4"/><path d="m8 12 3 3 5-6"/>',
+'lightbulb':'<path d="M9 18h6m-5 4h4M7.5 14.5C5.8 13.2 5 11.5 5 9.5a7 7 0 0 1 14 0c0 2-.8 3.7-2.5 5-1 1-1.5 2.3-1.5 3.5h-6c0-1.2-.5-2.5-1.5-3.5z"/>',
+'search':'<circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 5 5"/>',
+'archive':'<rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v12h14V8M10 12h4"/>',
+'settings':'<path d="M10 2h4l.7 2.5 1.8.8 2.3-1.2 2.7 3-1.5 2.1.3 2 2.2 1.4-.9 3.9-2.7.2-1.3 1.6.5 2.6-3.6 1.5-1.9-1.9-2 .1-1.7 1.9-3.6-1.6.5-2.7-1.4-1.4-2.6-.1-.9-3.8 2.1-1.5.4-2L2.9 7l2.7-3 2.4 1.2 1.7-.8z"/><circle cx="12" cy="12" r="3"/>',
+'shield-check':'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
+'sparkles':'<path d="m12 3 1.9 6.1L20 11l-6.1 1.9L12 19l-1.9-6.1L4 11l6.1-1.9L12 3zM19 18l.7 1.3L21 20l-1.3.7L19 22l-.7-1.3L17 20l1.3-.7z"/>',
+'circle-help':'<circle cx="12" cy="12" r="10"/><path d="M9.5 9a3 3 0 1 1 4 2.8c-1 .5-1.5 1.2-1.5 2.2"/><path d="M12 17h.01"/>',
+'mouse-pointer-2':'<path d="m5 3 14 9-7 1-3 7z"/>',
+'hand':'<path d="M9 11V4a2 2 0 0 1 4 0v6-4a2 2 0 0 1 4 0v5-2a2 2 0 0 1 4 0v5c0 5-3 8-8 8h-2c-3 0-5-2-7-6l-2-3c-1-2 1-4 3-3z"/>',
+'git-branch':'<circle cx="6" cy="4" r="2"/><circle cx="18" cy="7" r="2"/><circle cx="6" cy="20" r="2"/><path d="M6 6v12m0-6c0-3 3-5 10-5"/>',
+'image-down':'<rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="8" cy="8" r="2"/><path d="m3 18 6-6 4 4 2-2 6 6M12 7v7m-3-3 3 3 3-3"/>',
+'plus':'<path d="M12 5v14M5 12h14"/>','minus':'<path d="M5 12h14"/>',
+'ellipsis':'<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+'sticky-note':'<path d="M4 3h16v12l-5 6H4z"/><path d="M15 21v-6h5"/>',
+'move-up-right':'<path d="M7 17 17 7m-8 0h8v8"/>',
+'edit-3':'<path d="M12 20H4v-8L15 1l8 8-11 11zM13 3l8 8"/>',
+'check':'<path d="m4 12 5 5L20 6"/>','x':'<path d="M5 5 19 19M19 5 5 19"/>',
+'copy':'<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>',
+'lock':'<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+'unlock':'<rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 7-3"/>',
+'pin':'<path d="m9 3 12 12-3 1-4 4-1 3-5-5-5-5 3-1 4-4zM3 21l6-6"/>',
+'calendar':'<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4M17 3v4M3 10h18"/>',
+'clock':'<circle cx="12" cy="12" r="9"/><path d="M12 7v6l4 2"/>',
+'paperclip':'<path d="m21 11-8 8a6 6 0 0 1-8-8L13 3a4 4 0 0 1 6 6l-8 8a2 2 0 0 1-3-3l7-7"/>',
+'link':'<path d="M10 13a5 5 0 0 0 7 .5l3-3a5 5 0 0 0-7-7l-2 2M14 11a5 5 0 0 0-7-.5l-3 3a5 5 0 1 0 7 7l2-2"/>',
+'undo-2':'<path d="M9 14 4 9l5-5M4 9h10a6 6 0 0 1 0 12h-2"/>',
+'redo-2':'<path d="m15 14 5-5-5-5m5 5H10a6 6 0 0 0 0 12h2"/>',
+'download':'<path d="M12 3v12m-4-4 4 4 4-4M4 16v5h16v-5"/>',
+'upload':'<path d="M12 21V9m-4 4 4-4 4 4M4 8V3h16v5"/>',
+'trash-2':'<path d="M3 6h18M8 6V4h8v2M6 6l1 15h10l1-15M10 10v7m4-7v7"/>',
+'rotate-ccw':'<path d="M3 11a9 9 0 1 0 3-6L3 8V3m0 5h5"/>',
+'info':'<circle cx="12" cy="12" r="10"/><path d="M12 11v6m0-10h.01"/>',
+'filter':'<path d="M3 5h18M6 12h12M9 19h6"/>',
+'external-link':'<path d="M13 4h7v7M20 4l-9 9M20 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5"/>',
+'chevron-right':'<path d="m9 5 7 7-7 7"/>','arrow-left':'<path d="M20 12H4m6-6-6 6 6 6"/>',
+'check-circle':'<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
+'more-vertical':'<circle cx="12" cy="5" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="12" cy="19" r="1"/>',
+'file':'<path d="M5 3h10l5 5v13H5zM15 3v5h5"/>',
+'palette':'<circle cx="12" cy="12" r="10"/><circle cx="7.5" cy="10" r="1"/><circle cx="10" cy="6.5" r="1"/><circle cx="16" cy="8" r="1"/><path d="M17 13a2 2 0 0 0-2 2c0 2 2 2 2 4"/>',
+'sun':'<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+'moon':'<path d="M20.5 13A9 9 0 0 1 11 3.5 9 9 0 1 0 20.5 13z"/>',
+'grip':'<circle cx="9" cy="6" r="1"/><circle cx="15" cy="6" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="18" r="1"/><circle cx="15" cy="18" r="1"/>'
+, 'square-dashed':'<path d="M7 3h3m4 0h3m4 4v3m0 4v3m-4 4h-3m-4 0H7m-4-4v-3m0-4V7m4-4H5a2 2 0 0 0-2 2v2m18 10v2a2 2 0 0 1-2 2h-2"/>'
+, 'move-diagonal-2':'<path d="M5 19 19 5M12 5h7v7M5 12v7h7"/>'
+, 'eye':'<path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/>'
+, 'file-text':'<path d="M5 3h10l5 5v13H5zM15 3v5h5M8 12h8M8 16h8"/>'
+, 'sliders-horizontal':'<path d="M3 7h18M3 17h18"/><circle cx="9" cy="7" r="3" fill="white"/><circle cx="15" cy="17" r="3" fill="white"/>'
+, 'book-open':'<path d="M12 7c-4-2-7-2-10-1v14c3-1 6-1 10 1 4-2 7-2 10-1V6c-3-1-6-1-10 1zM12 7v14"/>'
+, 'bold':'<path d="M6 4h6a4 4 0 0 1 0 8H6zM6 12h7a4 4 0 0 1 0 8H6z"/>'
+, 'italic':'<path d="M10 4h10M4 20h10M15 4 9 20"/>'
+, 'underline':'<path d="M5 4v8a7 7 0 0 0 14 0V4M4 21h16"/>'
+, 'eraser':'<path d="m14 3 7 7-10 11H6l-4-4zM8 14l6 6M11 21h11"/>'
+, 'list-checks':'<path d="m3 5 2 2 3-3M11 6h10M3 13l2 2 3-3M11 14h10M3 21l2-2 3 2M11 21h10"/>',
+'circle-dot':'<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/>',
+'type':'<path d="M4 7V4h16v3M12 4v16m-4 0h8"/>',
+'chevron-left':'<path d="m15 5-7 7 7 7"/>'
+};
+function ico(name, size=19) { return `<svg aria-hidden="true" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">${paths[name] || paths.info}</svg>`; }
+function injectIcons(root=document) { root.querySelectorAll('[data-icon]').forEach(el => { el.innerHTML = ico(el.dataset.icon); }); }
+
+
+/* richtext.js */
+/* Local-only HTML sanitizer for note content. No scripts, remote media, inline events, or arbitrary CSS. */
+const tags = new Set(['B','STRONG','I','EM','U','S','STRIKE','P','DIV','BR','UL','OL','LI','SPAN','H2','H3','BLOCKQUOTE','A','FONT']);
+const families = {'arial':'Arial','georgia':'Georgia','verdana':'Verdana','trebuchet ms':'Trebuchet MS','times new roman':'Times New Roman','courier new':'Courier New'};
+const htmlSizes = {1:11,2:13,3:16,4:18,5:24,6:30,7:38};
+function sanitizeRichHtml(html) {
+  const parser = document.createElement('template');parser.innerHTML = String(html || '');
+  function safeChildren(parent) {return Array.from(parent.childNodes).map(safeNode).join('');}
+  function safeNode(node) {
+    if (node.nodeType === 3) return escapeHtml(node.nodeValue);
+    if (node.nodeType !== 1) return '';
+    const name = node.tagName.toUpperCase();
+    const inside = safeChildren(node);
+    if (!tags.has(name)) return inside;
+    if (name === 'BR') return '<br>';
+    if (name === 'A') {
+      const raw = node.getAttribute('href') || '';
+      let href = ''; try { const u = new URL(raw); if (['https:','http:','mailto:'].includes(u.protocol)) href = u.href; } catch {}
+      return href ? `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${inside}</a>` : inside;
+    }
+    const styles=[];
+    const rawStyle=node.getAttribute('style')||'';
+    const rawColor=name==='FONT'?(node.getAttribute('color')||''):'';
+    const rawFace=name==='FONT'?(node.getAttribute('face')||''):'';
+    const rawSize=name==='FONT'?(htmlSizes[Number(node.getAttribute('size'))]||''):'';
+    const vals={};
+    for (const part of rawStyle.split(';')) {const idx=part.indexOf(':');if(idx<0)continue;const key=part.slice(0,idx).trim().toLowerCase();vals[key]=part.slice(idx+1).trim();}
+    const color=(rawColor||vals.color||'').trim();
+    if (/^#[0-9a-f]{3,8}$/i.test(color)||/^rgba?\(\s*[\d.,%\s]+\)$/.test(color)) styles.push(`color:${color}`);
+    const family=(rawFace||vals['font-family']||'').replaceAll(/['"]/g,'').trim().toLowerCase();
+    if (families[family]) styles.push(`font-family:'${families[family]}'`);
+    const size=rawSize||parseInt(vals['font-size']||'',10);
+    if (size>=9&&size<=72) styles.push(`font-size:${size}px`);
+    if (/^(bold|700|800|900)$/i.test(vals['font-weight']||'')) styles.push('font-weight:bold');
+    if (/^italic$/i.test(vals['font-style']||'')) styles.push('font-style:italic');
+    if (/^underline$/i.test(vals['text-decoration']||'')) styles.push('text-decoration:underline');
+    const tag=name==='FONT'?'span':name.toLowerCase();
+    return `<${tag}${styles.length?` style="${escapeHtml(styles.join(';'))}"`:''}>${inside}</${tag}>`;
+  }
+  return safeChildren(parser.content);
+}
+function escapeHtml(str) {return String(str??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');}
+function plainTextOf(html) {
+  const el=document.createElement('div');el.innerHTML=sanitizeRichHtml(html);
+  // Preserve paragraph boundaries even when the element is detached (innerText
+  // behaves differently on off-screen nodes in some Android WebViews).
+  function walk(node) {
+    if(node.nodeType===3)return node.nodeValue||'';
+    if(node.nodeType!==1)return Array.from(node.childNodes).map(walk).join('');
+    if(node.tagName==='BR')return '\n';
+    const content=Array.from(node.childNodes).map(walk).join('');
+    return /^(P|DIV|LI|UL|OL|H2|H3|BLOCKQUOTE)$/.test(node.tagName)?content+'\n':content;
+  }
+  return Array.from(el.childNodes).map(walk).join('').trimEnd();
+}
+function noteContentHtml(note){return note.contentHtml ? sanitizeRichHtml(note.contentHtml) : escapeHtml(note.description||'').replace(/\r?\n/g,'<br>');}
+
+
+/* export.js */
+
+const html = (s) => String(s || '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
+function exportBoardSvg(notes, links, boardName, size = { width: 1480, height: 1050 }) {
+  const visible = notes.filter(n=>!n.archived && !n.deleted);
+  const pad = 100;
+  const left = Math.min(0, ...visible.map(n=>n.x)) - pad;
+  const top = Math.min(0, ...visible.map(n=>n.y)) - pad;
+  const right = Math.max(1200, ...visible.map(n=>n.x+n.w)) + pad;
+  const bottom = Math.max(850, ...visible.map(n=>n.y+n.h)) + pad;
+  const w = right - left, h = bottom - top;
+  const nmap = new Map(visible.map(n=>[n.id,n]));
+  const card = n => {
+    const x=n.x-left, y=n.y-top;
+    return `<g transform="translate(${x} ${y})"><rect width="${n.w}" height="${n.h}" rx="4" fill="${({butter:'#f7dea0',rose:'#f4bec2',sage:'#c7dbbd',sky:'#bfdbeb',lilac:'#dcd0ee',cream:'#f8edc9'})[n.color]||'#f7dea0'}" filter="url(#shadow)"/><rect width="${n.w}" height="8" fill="#ffffff" opacity=".12"/><circle cx="${n.w/2}" cy="17" r="10" fill="#8e3a30"/><circle cx="${n.w/2-3}" cy="14" r="3.5" fill="#ffffff" opacity=".55"/><text x="17" y="58" fill="#3f322d" font-weight="bold" font-size="21" font-family="sans-serif">${html(n.title).slice(0, 30)}</text>${(n.description||'').slice(0,144).split('\n').flatMap(t=>{const lines=[];while(t.length>0){lines.push(t.slice(0,Math.floor((n.w-30)/8)));t=t.slice(Math.floor((n.w-30)/8));}return lines;}).slice(0,Math.floor((n.h-90)/23)).map((line,i)=>`<text x=\"17\" y=\"${92+i*23}\" fill=\"#514941\" font-size=\"15\" font-family=\"sans-serif\">${html(line)}</text>`).join('')}</g>`;
+  };
+  let edges='';
+  for(const edge of links) {
+    const a=nmap.get(edge.from),b=nmap.get(edge.to);
+    if (!a||!b) continue;
+    const p=pinPosition(a), q=pinPosition(b);
+    const x1=p.x-left,y1=p.y-top,x2=q.x-left,y2=q.y-top;
+    const sag = Math.min(34, Math.max(9,Math.hypot(x2-x1,y2-y1)*.07));
+    edges+=`<path d="M${x1} ${y1} Q${(x1+x2)/2} ${(y1+y2)/2+sag} ${x2} ${y2}" stroke="#b34434" fill="none" stroke-width="3"/>`;
+  }
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><defs><pattern id="cork" width="47" height="47" patternUnits="userSpaceOnUse"><rect width="47" height="47" fill="#c7a379"/><path d="M0 20l20-11m13 7 14 5M8 38l21 3m-7-35 8 13" stroke="#805d42" stroke-opacity=".15" stroke-width="2"/><circle cx="6" cy="5" r="1" fill="#946c45"/><circle cx="34" cy="30" r="2" fill="#946c45" opacity=".4"/></pattern><filter id="shadow" x="-10%" y="-10%" width="120%" height="130%"><feDropShadow dx="2" dy="5" stdDeviation="5" flood-opacity=".23"/></filter></defs><rect width="100%" height="100%" fill="url(#cork)"/><rect x="8" y="8" width="${w-16}" height="${h-16}" rx="9" fill="none" stroke="#80502c" stroke-width="16"/>${edges}${visible.map(card).join('')}<text x="${w-26}" y="${h-30}" fill="#574331" font-size="17" text-anchor="end" font-family="sans-serif">IDEAVAULT · ${html(boardName)}</text></svg>`;
+  return svg;
+}
+async function exportPng(notes, links, name) {
+  const svg = exportBoardSvg(notes,links,name);
+  const blob = new Blob([svg],{type:'image/svg+xml;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = new Image();
+    await new Promise((resolve,reject)=>{img.onload=resolve;img.onerror=reject;img.src=url;});
+    const canvas = document.createElement('canvas');
+    const scale=Math.min(1,4096/Math.max(img.naturalWidth,img.naturalHeight));canvas.width=Math.round(img.naturalWidth*scale);canvas.height=Math.round(img.naturalHeight*scale);
+    const ctx=canvas.getContext('2d');
+    ctx.fillStyle='#c8a378';ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.drawImage(img,0,0,canvas.width,canvas.height);
+    const png = await new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error('Canvas export failed.')),'image/png'));
+    return png;
+  } finally {URL.revokeObjectURL(url);}
+}
+
+// Native notification bridge is intentionally absent in the standalone web edition.
+function androidNotificationsAvailable(){return false;}
+async function refreshReminder(){return {supported:false};}
+async function resetReminders(){return;}
+async function cancelReminder(){return;}
+
+
+/* main.js */
+
+
+
+
+
+
+
+const $ = s => document.querySelector(s);
+const escape = value => String(value ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;');
+const uid = () => globalThis.crypto?.randomUUID?.() ?? `iv-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+const colors = {butter:'#f5dda6',rose:'#f3c4c4',sage:'#cadcbc',sky:'#bddce8',lilac:'#dccfed',cream:'#f3e9c8'};
+const sizes = {small:[205,180],medium:[242,232],large:[295,290]};
+const dateShort = time => time ? new Date(time).toLocaleDateString(undefined,{month:'short',day:'numeric'}) : '';
+const nowIso = () => new Date().toISOString();
+const boardTitle = id => id === 'ideas' ? 'Ideas board' : 'To-do board';
+const defaultBoards = () => [
+  {id:'todo', zoom:1, ox:12, oy:3}, {id:'ideas', zoom:1, ox:12, oy:3}
+];
+const createNote = (boardId,x,y,title='Untitled note',color='butter') => {
+  ensureWorldSpace(Math.max(0,x),Math.max(0,y));
+  return ({
+  id:uid(),boardId,x:clamp(Math.round(x),0,WORLD_W-310),y:clamp(Math.round(y),0,WORLD_H-330),
+  w:242,h:232,title,description:'',color,rotation:(Math.random()-.5)*3.5,
+  checklist:[],choices:[],selectedChoiceId:'',contentHtml:'',priority:'normal',completed:false,due:'',reminder:'',group:'',externalLink:'',
+  locked:false,pinned:false,archived:false,deleted:false,createdAt:nowIso(),updatedAt:nowIso()
+});};
+const state={notes:[],links:[],boards:defaultBoards(),preferences:{theme:'light',reducedMotion:false,onboarded:false},view:'todo',tool:'select',connectFrom:null,archiveTab:'archived',undo:[],redo:[],detailId:null,detailDirty:false,modalMode:'preview',editTab:'details',contentTool:null,query:'',activeLink:null};
+const viewport=$('#boardViewport'),world=$('#boardWorld'),notesLayer=$('#notesLayer'),stringsLayer=$('#stringsLayer'),modalRoot=$('#modalRoot'),listView=$('#listView');
+let savedRichRange=null,cardRefreshTimer=null;
+let saveTimers=new Map(),viewSaveTimer,toastTimer,attachmentUrls=new Map(),activeBoardGesture=null,lastTap=null;
+const board = () => state.boards.find(b=>b.id===state.view);
+const noteById = id=>state.notes.find(n=>n.id===id);
+const visibleNotes = id=>state.notes.filter(n=>n.boardId===id&&!n.archived&&!n.deleted);
+const visibleLinks = id=>state.links.filter(e=>e.boardId===id&&noteById(e.from)&&noteById(e.to)&&!noteById(e.from).archived&&!noteById(e.to).archived&&!noteById(e.from).deleted&&!noteById(e.to).deleted);
+const saveError = e => {console.error(e);toast('Could not save locally. Check your device storage and export a backup.',true);};
+const saveNote = n => db.put('notes',n).catch(saveError);
+const saveBoard = () => db.put('boards',board()).catch(saveError);
+const savePrefs = () => db.put('preferences',{key:'settings',value:state.preferences}).catch(saveError);
+function toast(message,isError=false){const el=document.createElement('div');el.className=`toast ${isError?'error':''}`;el.textContent=message;$('#toastRoot').append(el);clearTimeout(toastTimer);toastTimer=setTimeout(()=>{el.remove();},3500);setTimeout(()=>el.remove(),4500);}
+function history(){state.undo.push(JSON.stringify({notes:state.notes,links:state.links,boards:state.boards}));if(state.undo.length>32)state.undo.shift();state.redo.length=0;}
+async function applySnapshot(serialized){for(const t of saveTimers.values())clearTimeout(t);saveTimers.clear();const data=JSON.parse(serialized);state.notes=data.notes;state.links=data.links;state.boards=data.boards;for(const n of data.notes)ensureWorldSpace(n.x,n.y,n.w,n.h);await db.replaceCore(data);renderMain();if(state.detailId&&noteById(state.detailId))state.modalMode==='edit'?openDetail(state.detailId,state.editTab):openPreview(state.detailId);else closeModal();await resetReminders(state.notes);}
+async function undo(){if(!state.undo.length){toast('Nothing to undo.');return;}const current=JSON.stringify({notes:state.notes,links:state.links,boards:state.boards});const prev=state.undo.pop();state.redo.push(current);try{await applySnapshot(prev);toast('Undone.');}catch(e){saveError(e);}}
+async function redo(){if(!state.redo.length){toast('Nothing to redo.');return;}const current=JSON.stringify({notes:state.notes,links:state.links,boards:state.boards});const next=state.redo.pop();state.undo.push(current);try{await applySnapshot(next);toast('Redone.');}catch(e){saveError(e);}}
+function queueSave(n,wait=300){clearTimeout(saveTimers.get(n.id));saveTimers.set(n.id,setTimeout(()=>{saveTimers.delete(n.id);saveNote(n);},wait));}
+async function flushSaves(){for(const [id,t] of saveTimers){clearTimeout(t);const n=noteById(id);if(n)await saveNote(n);}saveTimers.clear();}
+function startEditHistory(){if(!state.detailDirty){history();state.detailDirty=true;}}
+function markEdited(n,needRemind=false){n.updatedAt=nowIso();queueSave(n,240);if(needRemind)refreshReminder(n).then(r=>{if(r?.denied)toast('Reminder permission was denied.',true);}).catch(e=>toast(`Reminder unavailable: ${e.message}`,true));}
+function renderHeader(){const b=state.view,views={todo:['YOUR SPACE / 01','To-do board','A little order for everything on your mind.'],ideas:['YOUR SPACE / 02','Ideas board','Collect the sparks. Connect the dots.'],search:['YOUR WORKSPACE / FIND','Search notes','Find that thought before it slips away.'],archive:['YOUR WORKSPACE / KEEP','Archive & trash','Nothing truly good is ever lost.'],settings:['YOUR WORKSPACE / PERSONALIZE','Your preferences','Make IdeaVault feel like yours.']};const v=views[b];$('#viewKicker').textContent=v[0];$('#viewTitle').innerHTML=`${v[1]} <span class="title-accent">✳</span>`;$('#viewSubtitle').textContent=v[2];$('#todoCount').textContent=visibleNotes('todo').length;$('#ideasCount').textContent=visibleNotes('ideas').length;document.querySelectorAll('[data-nav]').forEach(el=>el.classList.toggle('active',el.dataset.nav===b));}
+function renderMain(){renderHeader();const showBoard=['todo','ideas'].includes(state.view);$('#boardView').classList.toggle('hidden',!showBoard);listView.classList.toggle('hidden',showBoard);if(showBoard){renderBoard();}else{renderList();}}
+function renderBoard(){const b=board();if(!b)return;updateWorldDimensions();viewport.className=`board-viewport mode-${state.tool}`;document.querySelectorAll('[data-tool]').forEach(el=>el.classList.toggle('selected',el.dataset.tool===state.tool));$('#connectionKind').disabled=state.tool!=='connect';updateTransform();renderNotes();renderStrings();const ns=visibleNotes(state.view);const links=visibleLinks(state.view);$('#boardEmpty').classList.toggle('hidden',ns.length>0);$('#boardStats').textContent=`${ns.length} note${ns.length!==1?'s':''} · ${links.length} connection${links.length!==1?'s':''}`;$('#boardHint').innerHTML=ico(state.tool==='connect'?'git-branch':'mouse-pointer-2',14)+(state.tool==='connect'?'Tap two thumbtacks to tie a string':'Drag to rearrange · Double-click board to add');$('#zoomLabel').textContent=`${Math.round(b.zoom*100)}%`;updateConnectBanner();}
+function updateWorldDimensions(){world.style.width=`${WORLD_W}px`;world.style.height=`${WORLD_H}px`;notesLayer.style.width=`${WORLD_W}px`;notesLayer.style.height=`${WORLD_H}px`;stringsLayer.setAttribute('width',String(WORLD_W));stringsLayer.setAttribute('height',String(WORLD_H));stringsLayer.setAttribute('viewBox',`0 0 ${WORLD_W} ${WORLD_H}`);}
+function updateTransform(){const b=board();if(!b)return;world.style.transform=`translate(${b.ox}px, ${b.oy}px) scale(${b.zoom})`;$('#zoomLabel').textContent=`${Math.round(b.zoom*100)}%`;}
+function noteCard(n){const complete=n.completed;const dueOver=n.due&&new Date(n.due+'T23:59:59').getTime()<Date.now()&&!complete;const checklistCount=n.checklist?.length||0;const checkDone=n.checklist?.filter(x=>x.done).length||0;const badge=[n.priority==='high'?'<span class="note-badge urgent">HIGH PRIORITY</span>':'',n.pinned?`<span class="note-badge">PINNED</span>`:'',complete?'<span class="note-badge complete">DONE ✓</span>':'',n.group?`<span class="note-badge">${escape(n.group.slice(0,17))}</span>`:''].join('');return `<article class="note paper-${n.color} ${complete?'is-completed':''} ${n.locked?'locked':''}" data-note-id="${n.id}" style="left:${n.x}px;top:${n.y}px;width:${n.w}px;height:${n.h}px;transform:rotate(${n.rotation||0}deg);z-index:${n.pinned?4:1}" role="button" tabindex="0" aria-label="${escape(n.title)}. Tap to preview"><button class="note-pin" data-pin="${n.id}" aria-label="Connect ${escape(n.title)}" title="Connect this pin"><span class="pin-head"></span></button><div class="note-body"><div class="note-badges">${badge}</div><div class="note-title">${escape(n.title||'Untitled note')}</div>${n.description?`<p class="note-description">${escape(n.description.slice(0,750))}</p>`:''}${n.previewAttachmentId?`<img class="note-image-preview" data-thumb="${escape(n.previewAttachmentId)}" alt="Image attached to note">`:''}</div><div class="note-footer">${n.boardId==='todo'?`<button class="note-complete-toggle ${complete?'done':''}" data-note-complete="${n.id}" aria-label="${complete?'Mark incomplete':'Mark completed'}">${complete?ico('check',14):''}</button>`:''}<span class="note-meta ${dueOver?'date-overdue':''}">${n.due?`${ico('calendar',12)}${dateShort(n.due+'T00:00:00')}`:checklistCount?`${ico('check-square',12)}${checkDone}/${checklistCount}`:n.externalLink?ico('link',13):''}</span><button class="note-more" data-note-menu="${n.id}" aria-label="Note actions">${ico('ellipsis',16)}</button></div>${!n.locked?`<button class="note-resize" data-note-resize="${n.id}" aria-label="Resize ${escape(n.title)}" title="Drag to resize note">${ico('move-diagonal-2',15)}</button>`:''}</article>`;}
+function renderNotes(){const ns=visibleNotes(state.view);notesLayer.innerHTML=ns.map(noteCard).join('');hydrateNoteImages();}
+async function hydrateNoteImages(){for(const image of notesLayer.querySelectorAll('[data-thumb]')){const id=image.dataset.thumb;try{let url=attachmentUrls.get(id);if(!url){const f=await db.getOne('attachments',id);if(!f||!f.type.startsWith('image/'))continue;url=URL.createObjectURL(f.blob);attachmentUrls.set(id,url);}if(image.isConnected)image.src=url;}catch(e){console.warn('Image preview not available',e);}}}
+function renderSingleNote(n){if(n.boardId!==state.view)return;const old=notesLayer.querySelector(`[data-note-id="${n.id}"]`);if(old)old.outerHTML=noteCard(n);else renderNotes();hydrateNoteImages();renderStringsFor(n.id);}
+function renderStrings(){const links=visibleLinks(state.view);stringsLayer.innerHTML=links.map(e=>{const d=stringPath(noteById(e.from),noteById(e.to));const cls=e.kind==='dependency'?'dependency':'';return `<g data-edge="${e.id}"><path class="wire-shadow" d="${d}"/><path class="wire ${cls}" d="${d}"/><path class="hit" data-link="${e.id}" d="${d}"/></g>`;}).join('');}
+function renderStringsFor(id){for(const e of state.links.filter(l=>l.boardId===state.view&&(l.from===id||l.to===id))){const a=noteById(e.from),b=noteById(e.to);if(!a||!b)continue;const group=stringsLayer.querySelector(`[data-edge="${e.id}"]`);if(!group)continue;for(const p of group.querySelectorAll('path'))p.setAttribute('d',stringPath(a,b));}}
+
+function updateConnectBanner(){const isConnect=state.tool==='connect';$('#cancelConnect').classList.toggle('hidden',!isConnect);if(isConnect){const from=noteById(state.connectFrom);$('#connectBannerText').textContent=from?`From “${from.title.slice(0,19)}” · tap another pin`:'Tap a thumbtack to start a string';notesLayer.querySelectorAll('[data-pin]').forEach(p=>p.classList.toggle('pin-selected',p.dataset.pin===state.connectFrom));}}
+function changeTool(next){state.tool=next;state.connectFrom=null;renderBoard();}
+function selectPin(id){if(state.tool!=='connect'){changeTool('connect');state.connectFrom=id;updateConnectBanner();return;}if(!state.connectFrom){state.connectFrom=id;updateConnectBanner();return;}if(state.connectFrom===id){state.connectFrom=null;updateConnectBanner();return;}const from=state.connectFrom;const kind=$('#connectionKind').value;if(!allowedLink(state.links,state.view,from,id,kind)){toast('These notes are already connected.');state.connectFrom=null;updateConnectBanner();return;}history();const edge={id:uid(),boardId:state.view,from,to:id,kind,createdAt:nowIso()};state.links.push(edge);db.put('links',edge).catch(saveError);state.connectFrom=null;renderBoard();toast(kind==='dependency'?'Dependency string tied.':'Red string connected.');}
+function addNoteAt(x,y){if(!['todo','ideas'].includes(state.view))return;history();const n=createNote(state.view,x,y,'New thought',state.view==='ideas'?'rose':'butter');state.notes.push(n);saveNote(n);renderBoard();openDetail(n.id,'details');$('#detailTitle')?.focus();toast('New note added to the board.');}
+function addNoteCenter(){const r=viewport.getBoundingClientRect();const pos=worldPoint(r.left+r.width/2,r.top+r.height/2,r,board());addNoteAt(pos.x-121+Math.random()*20,pos.y-116+Math.random()*18);}
+function changeView(next){if(!['todo','ideas','search','archive','settings'].includes(next))return;const changed=state.view!==next;flushSaves().catch(saveError);state.view=next;state.connectFrom=null;state.detailId=null;closeModal();renderMain();window.location.hash=next;if(changed){document.querySelectorAll('[data-nav].active').forEach(el=>{el.classList.remove('nav-just-selected');void el.offsetWidth;el.classList.add('nav-just-selected');});const pane=state.view==='todo'||state.view==='ideas'?$('#boardView'):listView;pane.classList.remove('view-just-opened');void pane.offsetWidth;pane.classList.add('view-just-opened');}}
+function setZoom(z,cx,cy){if(!board())return;const r=viewport.getBoundingClientRect();const b=board();zoomAround(b,z,cx??r.left+r.width/2,cy??r.top+r.height/2,r);updateTransform();clearTimeout(viewSaveTimer);viewSaveTimer=setTimeout(saveBoard,450);}
+function focusNote(id){const n=noteById(id);if(!n)return;if(n.deleted||n.archived){toast('Restore this note before jumping to its board.');return;}state.view=n.boardId;renderMain();const r=viewport.getBoundingClientRect();const b=board();b.zoom=clamp(b.zoom,.65,1.5);b.ox=r.width/2-(n.x+n.w/2)*b.zoom;b.oy=r.height/2-(n.y+n.h/2)*b.zoom;updateTransform();saveBoard();const card=notesLayer.querySelector(`[data-note-id="${id}"]`);if(card){card.animate([{filter:'brightness(1)'},{filter:'brightness(1.2)'},{filter:'brightness(1)'}],{duration:700});}openPreview(id);}
+function dueDateTimeToLocal(iso){if(!iso)return '';const d=new Date(iso);if(Number.isNaN(d.getTime()))return '';const off=d.getTimezoneOffset();return new Date(d.getTime()-off*60000).toISOString().slice(0,16);}
+function localToIso(local){if(!local)return '';const d=new Date(local);return Number.isNaN(d.getTime())?'':d.toISOString();}
+function contentLists(n,readonly=false){
+ const check=(n.checklist||[]).map(item=>readonly?`<label class="reading-item"><span>${item.done?'☑':'☐'}</span><span>${escape(item.text)}</span></label>`:`<div class="check-row" data-check-id="${item.id}"><input type="checkbox" data-check-toggle="${item.id}" ${item.done?'checked':''} aria-label="Complete checklist item"><textarea class="list-text" rows="1" data-check-text="${item.id}" aria-label="Checklist item">${escape(item.text)}</textarea><button type="button" data-check-remove="${item.id}" aria-label="Remove checklist item">${ico('x',15)}</button></div>`).join('');
+ const radios=(n.choices||[]).map(item=>readonly?`<label class="reading-item"><span>${n.selectedChoiceId===item.id?'◉':'◯'}</span><span>${escape(item.text)}</span></label>`:`<div class="check-row choice-row"><input type="radio" name="noteSingleChoice" data-choice-toggle="${item.id}" ${n.selectedChoiceId===item.id?'checked':''} aria-label="Select choice"><textarea class="list-text" rows="1" data-choice-text="${item.id}" aria-label="Single-choice item">${escape(item.text)}</textarea><button type="button" data-choice-remove="${item.id}" aria-label="Remove choice">${ico('x',15)}</button></div>`).join('');
+ if(readonly)return `${check?`<div class="reading-items"><div class="read-subheading">Checklist</div>${check}</div>`:''}${radios?`<div class="reading-items"><div class="read-subheading">Single choice</div>${radios}</div>`:''}`;
+ const checklistOpen=state.contentTool==='checklist',radioOpen=state.contentTool==='radio';
+ return `<section id="contentToolChecklist" class="editor-tool-panel ${checklistOpen?'':'hidden'}" aria-label="Checklist editor"><div class="editor-tool-panel-head"><div><strong>${ico('list-checks',17)} Checklist</strong><span>${(n.checklist||[]).filter(x=>x.done).length}/${(n.checklist||[]).length} done</span></div><button type="button" data-content-tool="checklist" aria-label="Close checklist">${ico('x',16)}</button></div><form id="newChecklistForm" class="editor-quick-add"><textarea id="newCheckText" rows="1" placeholder="Write a checklist item…" aria-label="New checklist item" required></textarea><button type="submit" aria-label="Add checklist item">${ico('plus',18)}</button></form>${check?`<div class="checklist-items">${check}</div>`:''}</section>
+ <section id="contentToolRadio" class="editor-tool-panel ${radioOpen?'':'hidden'}" aria-label="Single-choice editor"><div class="editor-tool-panel-head"><div><strong>${ico('circle-dot',17)} Single choice</strong><span>Choose one answer</span></div><button type="button" data-content-tool="radio" aria-label="Close single-choice editor">${ico('x',16)}</button></div><form id="newChoiceForm" class="editor-quick-add"><textarea id="newChoiceText" rows="1" placeholder="Write a choice…" aria-label="New single-choice option" required></textarea><button type="submit" aria-label="Add single-choice option">${ico('plus',18)}</button></form>${radios?`<div class="checklist-items">${radios}</div>`:''}</section>`;
+}
+function attachmentsToolTemplate(){return `<section id="contentToolAttachments" class="editor-tool-panel ${state.contentTool==='attachments'?'':'hidden'}" aria-label="Attachments editor"><div class="editor-tool-panel-head"><div><strong>${ico('paperclip',17)} Attachments</strong><span>Files stay on this device</span></div><button type="button" data-content-tool="attachments" aria-label="Close attachments">${ico('x',16)}</button></div><label class="editor-attach-button file-label">${ico('paperclip',16)} Add images or files<input id="attachmentInput" type="file" multiple accept="image/*,.pdf,.txt,.doc,.docx,.zip,application/pdf"/></label><p class="field-hint">Maximum 10 MB per file. Your note text has no word limit.</p><div id="attachmentList" class="attachment-list" aria-live="polite"></div></section>`;}
+function toggleContentTool(which){if(state.modalMode!=='edit')return;state.contentTool=state.contentTool===which?null:which;for(const btn of modalRoot.querySelectorAll('[data-content-tool]')){const active=state.contentTool===btn.dataset.contentTool;btn.classList.toggle('active',active);btn.setAttribute('aria-expanded',String(active));}for(const [type,id] of [['checklist','contentToolChecklist'],['radio','contentToolRadio'],['attachments','contentToolAttachments']]){$('#'+id)?.classList.toggle('hidden',state.contentTool!==type);}if(state.contentTool==='attachments')renderAttachments(state.detailId);if(state.contentTool==='checklist')$('#newCheckText')?.focus();if(state.contentTool==='radio')$('#newChoiceText')?.focus();}
+
+function detailTemplate(n){
+ const detailFields = `<p class="editor-intro">Adjust the paper, details, and optional dates here.</p><div class="field"><label for="detailTitle">Note title</label><textarea rows="2" id="detailTitle" class="title-input" data-edit="title" placeholder="Your big idea...">${escape(n.title)}</textarea></div>
+ <div class="field"><label>Paper color</label><div class="paper-colors">${Object.entries(colors).map(([key,c])=>`<button data-color="${key}" class="color-option ${n.color===key?'active':''}" style="background:${c}" aria-label="${key} paper" title="${key}"></button>`).join('')}</div></div>
+ <div class="field-row"><div class="field"><label>Note size</label><select data-edit="size" id="detailSize"><option value="custom" selected>Custom · ${n.w} × ${n.h}</option>${Object.entries(sizes).map(([k,v])=>`<option value="${k}">${k[0].toUpperCase()+k.slice(1)}</option>`).join('')}</select><p class="field-hint">Or drag the lower-right corner of the note to stretch it.</p></div><div class="field"><label>Priority</label><select data-edit="priority"><option value="low" ${n.priority==='low'?'selected':''}>Low</option><option value="normal" ${n.priority==='normal'?'selected':''}>Normal</option><option value="high" ${n.priority==='high'?'selected':''}>High priority</option></select></div></div>
+ <div class="field"><label>Project / group (optional)</label><input data-edit="group" value="${escape(n.group||'')}" placeholder="e.g. Launch plan" /></div>
+ ${n.boardId==='todo'?`<div class="field-row"><div class="field"><label>Due date (optional)</label><input type="date" data-edit="due" value="${escape(n.due||'')}"/></div><div class="field"><label>Remind me (optional)</label><input type="datetime-local" data-edit="reminder" value="${dueDateTimeToLocal(n.reminder)}"/></div></div><p class="field-hint">${androidNotificationsAvailable()?'Android will deliver reminders when notifications are allowed.':'Reminders are saved offline; native system alerts work in the Android app.'}</p><label class="switch-row">Task complete <input type="checkbox" data-edit-check="completed" ${n.completed?'checked':''}></label>`:''}
+ <div class="field"><label>Reference link (optional)</label><input data-edit="externalLink" type="url" value="${escape(n.externalLink||'')}" placeholder="https://..."/>${n.externalLink?`<button class="secondary-button" data-action="open-note-link">${ico('external-link',14)} Open reference</button>`:''}</div>
+ <div class="field-hint">Created ${new Date(n.createdAt).toLocaleString()} · Last edited ${new Date(n.updatedAt).toLocaleString()}</div>`;
+ const contentFields = `<p class="editor-intro">Compose without a character or word limit. Select text to style it. Use the formatting toolbar, then choose Checklist, Choice, or the paperclip to insert extras.</p>
+ <div class="rich-toolbar" aria-label="Formatting toolbar"><div class="rich-group"><button data-format="bold" aria-label="Bold" title="Bold">${ico('bold',17)}</button><button data-format="italic" aria-label="Italic" title="Italic">${ico('italic',17)}</button><button data-format="underline" aria-label="Underline" title="Underline">${ico('underline',17)}</button></div><select id="richFont" aria-label="Font family"><option value="Arial">Arial</option><option value="Georgia">Georgia</option><option value="Verdana">Verdana</option><option value="Trebuchet MS">Trebuchet</option><option value="Times New Roman">Times New Roman</option><option value="Courier New">Courier New</option></select><select id="richSize" aria-label="Font size"><option value="12">12px</option><option value="14">14px</option><option value="16" selected>16px</option><option value="18">18px</option><option value="22">22px</option><option value="28">28px</option><option value="36">36px</option></select><label class="rich-color-label" title="Text color"><input id="richColor" type="color" value="#4d4034" aria-label="Text color">${ico('palette',17)}</label><button data-format="removeFormat" class="format-clear" title="Clear formatting" aria-label="Clear formatting">${ico('eraser',16)}</button><span class="editor-toolbar-divider" aria-hidden="true"></span><div class="editor-insert-group" aria-label="Insert note elements"><button type="button" class="editor-insert-tool ${state.contentTool==='checklist'?'active':''}" data-content-tool="checklist" aria-controls="contentToolChecklist" aria-expanded="${state.contentTool==='checklist'}" title="Add or edit checklist">${ico('list-checks',17)}<span>Checklist</span></button><button type="button" class="editor-insert-tool ${state.contentTool==='radio'?'active':''}" data-content-tool="radio" aria-controls="contentToolRadio" aria-expanded="${state.contentTool==='radio'}" title="Add or edit single-choice options">${ico('circle-dot',17)}<span>Choice</span></button><button type="button" class="editor-insert-tool ${state.contentTool==='attachments'?'active':''}" data-content-tool="attachments" aria-controls="contentToolAttachments" aria-expanded="${state.contentTool==='attachments'}" title="Attach or manage files">${ico('paperclip',17)}<span>Attach</span><small id="attachmentCount" class="attachment-count hidden" aria-label="Number of attached files"></small></button></div></div>
+ <div class="editor-tool-panels">${contentLists(n)}${attachmentsToolTemplate()}</div>
+ <div class="field rich-field"><label for="richEditor">Note content</label><div id="richEditor" contenteditable="true" role="textbox" aria-label="Rich note content" aria-multiline="true" spellcheck="true" data-placeholder="Write everything on your mind…">${noteContentHtml(n)}</div><p class="field-hint">Unlimited text. Formatting and text are stored only on this device.</p></div>`;
+ return `<div class="detail-panel edit-panel" role="dialog" aria-modal="true" aria-label="Edit note">
+  <div class="detail-top"><div class="detail-headline"><span class="detail-logo">${ico('sticky-note',23)}</span><div><strong>Edit your note</strong><div class="section-kicker">AUTOSAVED TO THIS DEVICE</div></div></div><div class="detail-actions"><button class="icon-button" data-action="undo" title="Undo">${ico('undo-2')}</button><button class="icon-button" data-action="redo" title="Redo">${ico('redo-2')}</button><button class="icon-button" data-action="close-modal" title="Close editor">${ico('x')}</button></div></div>
+  <div class="editor-two-panels">
+   <section class="editor-pane editor-details-pane" aria-labelledby="editorDetailsHeading"><header class="editor-pane-head"><span class="editor-pane-icon">${ico('sliders-horizontal',18)}</span><div><span class="editor-pane-eyebrow">01 / PERSONALIZE</span><h2 id="editorDetailsHeading">Note details</h2></div></header><div class="editor-pane-body">${detailFields}<button type="button" class="editor-jump-button" data-action="jump-to-content">${ico('chevron-right',15)} Jump to content</button></div></section>
+   <section class="editor-pane editor-content-pane" aria-labelledby="editorContentHeading"><header class="editor-pane-head"><span class="editor-pane-icon">${ico('file-text',18)}</span><div><span class="editor-pane-eyebrow">02 / WRITE & CREATE</span><h2 id="editorContentHeading">Content</h2></div><span class="content-no-limit">NO WORD LIMIT</span></header><div class="editor-pane-body">${contentFields}</div></section>
+  </div>
+  <div class="detail-bottom editor-bottom"><button class="secondary-button" data-note-operation="duplicate">${ico('copy',15)} Duplicate</button><button class="secondary-button" data-note-operation="lock">${ico(n.locked?'unlock':'lock',15)} ${n.locked?'Unlock':'Lock'}</button><button class="secondary-button" data-note-operation="pin">${ico('pin',15)} ${n.pinned?'Unpin':'Pin'}</button><button class="secondary-button" data-note-operation="archive">${ico('archive',15)} Archive</button><button class="danger-button" data-note-operation="delete">${ico('trash-2',15)} Delete</button><span class="detail-save-indicator">${ico('check-circle',15)} Autosaved</span></div>
+ </div>`;
+}
+function previewTemplate(n){
+ return `<div class="note-preview-panel paper-${n.color}" role="dialog" aria-modal="true" aria-label="Preview note"><div class="preview-header"><span class="preview-kicker">${ico('book-open',17)} READ NOTE</span><button class="icon-button" data-action="close-modal" aria-label="Close preview">${ico('x',20)}</button></div><div class="preview-scroll"><h2>${escape(n.title)}</h2><div class="read-rich">${noteContentHtml(n)||'<p class="empty-prompt">No content yet.</p>'}</div>${contentLists(n,true)}${n.due?`<p class="preview-date">Due ${escape(n.due)}</p>`:''}<div class="preview-date">Updated ${new Date(n.updatedAt).toLocaleDateString()}</div></div><div class="preview-bottom"><button class="secondary-button" data-action="close-modal">Close</button><button class="primary-button" data-action="edit-from-preview">${ico('edit-3',16)} Edit note</button></div></div>`;
+}
+function openPreview(id){const n=noteById(id);if(!n||n.deleted)return;state.detailId=id;state.contentTool=null;state.modalMode='preview';state.detailDirty=false;modalRoot.innerHTML=`<div class="modal-overlay preview-overlay" id="detailOverlay">${previewTemplate(n)}</div>`;}
+async function openDetail(id,tab='details'){const n=noteById(id);if(!n||n.deleted)return;if(state.detailId!==id)state.contentTool=null;state.detailId=id;state.modalMode='edit';state.editTab=tab;state.detailDirty=false;savedRichRange=null;modalRoot.innerHTML=`<div class="modal-overlay" id="detailOverlay">${detailTemplate(n)}</div>`;await renderAttachments(id);}
+function closeModal(){savedRichRange=null;modalRoot.innerHTML='';state.detailId=null;state.contentTool=null;state.detailDirty=false;}
+async function renderAttachments(id){if(state.detailId!==id)return;const root=$('#attachmentList');if(!root)return;try{const files=await db.getNoteFiles(id);if(state.detailId!==id)return;const counter=$('#attachmentCount');if(counter){counter.textContent=String(files.length);counter.classList.toggle('hidden',!files.length);}root.innerHTML=files.length?'':'<p class="editor-attachments-empty">No files attached yet.</p>';for(const f of files){let url=attachmentUrls.get(f.id);if(!url){url=URL.createObjectURL(f.blob);attachmentUrls.set(f.id,url);}const item=document.createElement('div');item.className='attachment-item';item.innerHTML=`${f.type.startsWith('image/')?`<img class="attachment-thumb" src="${url}" alt="Attached image"/>`:ico('file',20)}<span class="attachment-name" title="${escape(f.name)}">${escape(f.name)}</span><button data-file-download="${f.id}" aria-label="Download ${escape(f.name)}">${ico('download',15)}</button><button data-file-remove="${f.id}" aria-label="Remove ${escape(f.name)}">${ico('x',15)}</button>`;root.append(item);}}
+catch(e){root.innerHTML='<p class="storage-warning">Attachments could not be loaded.</p>';saveError(e);}}
+function handleEdit(target){const n=noteById(state.detailId);if(!n)return;const field=target.dataset.edit;const check=target.dataset.editCheck;if(!field&&!check)return;startEditHistory();if(check)n[check]=target.checked;else if(field==='size'){if(!sizes[target.value])return;[n.w,n.h]=sizes[target.value];}else if(field==='reminder'){n.reminder=localToIso(target.value);}else{n[field]=target.value;}markEdited(n,['reminder','completed'].includes(field||check));if(n.boardId===state.view)renderSingleNote(n);}
+function saveRichFromEditor(){const editor=$('#richEditor'),n=noteById(state.detailId);if(!editor||!n)return;
+ startEditHistory();n.contentHtml=sanitizeRichHtml(editor.innerHTML);n.description=plainTextOf(n.contentHtml);markEdited(n);
+ clearTimeout(cardRefreshTimer);cardRefreshTimer=setTimeout(()=>renderSingleNote(n),260);
+}
+function rememberRichSelection(){const el=$('#richEditor');const sel=window.getSelection();if(!el||!sel?.rangeCount)return;const range=sel.getRangeAt(0);if(el.contains(range.commonAncestorContainer))savedRichRange=range.cloneRange();}
+function restoreRichSelection(){const el=$('#richEditor');if(!el)return false;el.focus();const sel=window.getSelection();if(savedRichRange&&el.contains(savedRichRange.commonAncestorContainer)){
+  sel.removeAllRanges();sel.addRange(savedRichRange);return true;
+ }return false;
+}
+function formatSelectedRich(type,value){const el=$('#richEditor');if(!el)return;restoreRichSelection();
+ if(['bold','italic','underline','removeFormat'].includes(type)){document.execCommand(type,false,null);}
+ else if(type==='font-family')document.execCommand('fontName',false,value);
+ else if(type==='color')document.execCommand('foreColor',false,value);
+ else if(type==='font-size'){
+  // WebView's editing engine supports the 1-7 semantic sizes, converted to safe px on save.
+  const sizes=[11,13,16,18,24,30,38];const idx=sizes.reduce((best,x,i)=>Math.abs(x-Number(value))<Math.abs(sizes[best]-Number(value))?i:best,0);
+  document.execCommand('fontSize',false,String(idx+1));
+ }
+ rememberRichSelection();saveRichFromEditor();
+}
+// Paste is locally sanitized before insertion; no externally-loaded HTML or scripts can enter a note.
+document.addEventListener('paste',e=>{if(e.target.id!=='richEditor')return;e.preventDefault();const html=e.clipboardData?.getData('text/html');const text=e.clipboardData?.getData('text/plain')||'';
+ document.execCommand('insertHTML',false,html?sanitizeRichHtml(html):escapeHtml(text).replace(/\r?\n/g,'<br>'));
+});
+document.addEventListener('selectionchange',()=>{if(state.modalMode==='edit')rememberRichSelection();});
+async function handleAttachmentFiles(files){const n=noteById(state.detailId);if(!n)return;let count=0;for(const file of files){if(file.size>10*1024*1024){toast(`${file.name} is larger than 10 MB.`,true);continue;}const item={id:uid(),noteId:n.id,name:file.name,type:file.type||'application/octet-stream',size:file.size,createdAt:nowIso(),blob:file};try{await db.put('attachments',item);if(file.type.startsWith('image/'))n.previewAttachmentId=item.id;count++;}catch(e){saveError(e);break;}}if(count){markEdited(n);renderAttachments(n.id);renderSingleNote(n);toast(`${count} file${count!==1?'s':''} attached locally.`);}}
+async function deleteFile(id){const n=noteById(state.detailId);if(!n)return;const ok=await confirmDialog('Remove attachment?','This file will be removed from this device and from future backups.');if(!ok)return;try{await db.remove('attachments',id);if(n.previewAttachmentId===id){const remaining=await db.getNoteFiles(n.id);n.previewAttachmentId=remaining.filter(f=>f.type.startsWith('image/')).at(-1)?.id||'';}URL.revokeObjectURL(attachmentUrls.get(id));attachmentUrls.delete(id);markEdited(n);renderAttachments(n.id);renderSingleNote(n);toast('Attachment removed.');}catch(e){saveError(e);}}
+function downloadBlob(blob, filename){const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=filename;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),2500);}
+async function confirmDialog(title,message,destructive=true,acceptLabel='Confirm'){return new Promise(resolve=>{const old=modalRoot.innerHTML;const el=document.createElement('div');el.id='confirmOverlay';el.className='modal-overlay dialog';el.style.zIndex=150;el.innerHTML=`<div class="confirm-panel" role="alertdialog" aria-modal="true"><h2>${escape(title)}</h2><p>${escape(message)}</p><div class="dialog-actions"><button class="secondary-button" id="confirmCancel">Cancel</button><button class="${destructive?'danger-button':'primary-button'}" id="confirmAccept">${destructive?'Continue':escape(acceptLabel)}</button></div></div>`;document.body.append(el);const done=v=>{el.remove();resolve(v);};el.querySelector('#confirmCancel').onclick=()=>done(false);el.querySelector('#confirmAccept').onclick=()=>done(true);el.addEventListener('click',e=>{if(e.target===el)done(false);});el.querySelector('#confirmAccept').focus();});}
+async function noteOperation(action,id=state.detailId){const n=noteById(id);if(!n)return;switch(action){
+case 'duplicate':{history();const newNote=structuredClone(n);newNote.id=uid();newNote.x+=32;newNote.y+=32;newNote.title=`${n.title} (copy)`;newNote.createdAt=nowIso();newNote.updatedAt=nowIso();newNote.archived=false;newNote.deleted=false;state.notes.push(newNote);await saveNote(newNote);const copies=await db.getNoteFiles(n.id);for(const file of copies){const cloned={...file,id:uid(),noteId:newNote.id};if(newNote.previewAttachmentId===file.id)newNote.previewAttachmentId=cloned.id;await db.put('attachments',cloned);}if(copies.length)await saveNote(newNote);closeModal();changeView(n.boardId);renderBoard();toast('Note duplicated.');break;}
+case 'lock':case 'pin':{history();if(action==='lock')n.locked=!n.locked;else n.pinned=!n.pinned;markEdited(n);renderBoard();if(state.detailId===n.id)openDetail(n.id,state.editTab);toast(action==='lock'?(n.locked?'Note locked.':'Note unlocked.'):(n.pinned?'Note pinned.':'Note unpinned.'));break;}
+case 'archive':{history();n.archived=true;markEdited(n,true);await db.replaceCore(state);closeModal();renderMain();toast('Moved to archive. Strings will return when restored.');break;}
+case 'delete':{const ok=await confirmDialog('Move note to trash?',`“${n.title}” will be hidden from its board. You can restore it from Archive & trash.`);if(!ok)return;history();n.deleted=true;n.archived=false;state.links=state.links.filter(e=>e.from!==n.id&&e.to!==n.id);await db.replaceCore(state).catch(saveError);refreshReminder(n).catch(saveError);closeModal();renderMain();toast('Note moved to trash.');break;}
+case 'complete':{history();n.completed=!n.completed;markEdited(n,true);renderMain();toast(n.completed?'Task marked completed.':'Task marked active.');break;}
+}}
+async function restoreNote(id){const n=noteById(id);if(!n)return;history();n.archived=false;n.deleted=false;markEdited(n,true);renderMain();toast('Note restored.');}
+async function permanentlyDeleteNote(id){const n=noteById(id);if(!n)return;const okay=await confirmDialog('Delete permanently?',`“${n.title}” and its attachments will be erased from this device. This cannot be undone.`);if(!okay)return;try{await db.deletePermanently(id);await cancelReminder(id);state.notes=state.notes.filter(v=>v.id!==id);state.links=state.links.filter(e=>e.from!==id&&e.to!==id);await db.replaceCore(state);state.undo=[];state.redo=[];renderMain();toast('Note permanently deleted.');}catch(e){saveError(e);}}
+async function deleteLink(id){const edge=state.links.find(e=>e.id===id);if(!edge)return;const okay=await confirmDialog('Remove red string?','Only the connection will be removed. The notes will remain.');if(!okay)return;history();state.links=state.links.filter(e=>e.id!==id);db.remove('links',id).catch(saveError);renderBoard();toast('String disconnected.');}
+function renderSearchResults(){const data=filteredNotes();const root=$('#resultsRoot');if(!root)return;root.innerHTML=`<div class="results-label">${data.length} MATCHING NOTE${data.length===1?'':'S'}</div><div class="results-grid">${data.map(n=>`<div class="result-card" role="button" tabindex="0" data-jump="${n.id}"><div class="result-top"><span class="color-chip" style="background:${colors[n.color]||colors.butter}"></span>${escape(boardTitle(n.boardId))} ${n.pinned?'· Pinned':''}</div><h3>${escape(n.title)}</h3><p>${escape(n.description)||'No description yet.'}</p><div class="result-bottom">${n.completed?'✓ Complete · ':''}${escape(n.priority)} priority · ${dateShort(n.updatedAt)}</div></div>`).join('')}</div>${!data.length?'<div class="empty-results"><h3>No notes found</h3><p>Try different words or loosen your filters.</p></div>':''}`;}
+function filteredNotes(){const query=($('#searchInput')?.value||state.query).toLowerCase().trim();const boardFilter=$('#filterBoard')?.value||'all',color=$('#filterColor')?.value||'all',priority=$('#filterPriority')?.value||'all',status=$('#filterStatus')?.value||'all',age=$('#filterDate')?.value||'all';return state.notes.filter(n=>!n.deleted&&!n.archived).filter(n=>!query||[n.title,n.description,n.group,n.externalLink,...(n.checklist||[]).map(c=>c.text),...(n.choices||[]).map(c=>c.text)].some(t=>String(t||'').toLowerCase().includes(query))).filter(n=>boardFilter==='all'||n.boardId===boardFilter).filter(n=>color==='all'||n.color===color).filter(n=>priority==='all'||n.priority===priority).filter(n=>status==='all'||(status==='done'?n.completed:status==='open'?!n.completed:n.pinned)).filter(n=>age==='all'||new Date(n.updatedAt).getTime()>Date.now()-(age==='week'?7:30)*86400000).sort((a,b)=>Number(b.pinned)-Number(a.pinned)||b.updatedAt.localeCompare(a.updatedAt));}
+function renderList(){if(state.view==='search'){listView.innerHTML=`<div class="list-intro"><div><h2>Find a thought</h2><p>All your notes, even when ideas get a little tangled.</p></div></div><div class="search-bar">${ico('search',20)}<input id="searchInput" type="search" placeholder="Search titles, descriptions, checklists, projects..." value="${escape(state.query)}" autocomplete="off"/></div><div class="filter-bar">${ico('filter',16)}<select id="filterBoard"><option value="all">Both boards</option><option value="todo">To-do board</option><option value="ideas">Ideas board</option></select><select id="filterColor"><option value="all">All colors</option>${Object.keys(colors).map(c=>`<option value="${c}">${c}</option>`).join('')}</select><select id="filterStatus"><option value="all">Any status</option><option value="done">Completed</option><option value="open">Not completed</option><option value="pinned">Pinned</option></select><select id="filterPriority"><option value="all">Any priority</option><option value="high">High</option><option value="normal">Normal</option><option value="low">Low</option></select><select id="filterDate"><option value="all">Any date</option><option value="week">Past 7 days</option><option value="month">Past 30 days</option></select></div><div id="resultsRoot"></div>`;renderSearchResults();return;}
+if(state.view==='archive'){const deleted=state.archiveTab==='trash';const data=state.notes.filter(n=>deleted?n.deleted:!n.deleted&&n.archived);listView.innerHTML=`<div class="list-intro"><div><h2>Things worth keeping</h2><p>Put finished work aside, or recover a thought that deserves another chance.</p></div></div><div class="tab-row"><button data-archive-tab="archived" class="${!deleted?'active':''}">Archived (${state.notes.filter(n=>n.archived&&!n.deleted).length})</button><button data-archive-tab="trash" class="${deleted?'active':''}">Recently deleted (${state.notes.filter(n=>n.deleted).length})</button></div><div class="results-grid">${data.sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)).map(n=>`<div class="result-card"><div class="result-top"><span class="color-chip" style="background:${colors[n.color]}"></span>${boardTitle(n.boardId)}</div><h3>${escape(n.title)}</h3><p>${escape(n.description)}</p><div class="result-bottom">${dateShort(n.updatedAt)}</div><div class="mini-actions"><button data-restore="${n.id}">${ico('rotate-ccw',14)} Restore</button>${deleted?`<button data-perma-delete="${n.id}">${ico('trash-2',14)} Delete forever</button>`:''}</div></div>`).join('')}</div>${!data.length?`<div class="empty-results"><h3>Nothing ${deleted?'in the trash':'archived'} yet</h3><p>${deleted?'Your deleted notes will be here until you permanently remove them.':'Keep notes without crowding your corkboards.'}</p></div>`:''}`;return;}
+if(state.view==='settings'){const p=state.preferences;listView.innerHTML=`<div class="list-intro"><div><h2>Your space, your rules</h2><p>No account needed. Your notes, images, strings and preferences live on this device.</p></div></div><div class="settings-grid"><section class="settings-card"><h3>Appearance</h3><p>Choose a warm daytime mood or a calmer evening workspace.</p><label class="setting-radio"><input type="radio" name="theme" value="light" ${p.theme==='light'?'checked':''}>${ico('sun',17)} Light & cozy</label><label class="setting-radio"><input type="radio" name="theme" value="dark" ${p.theme==='dark'?'checked':''}>${ico('moon',17)} Dark & focused</label><label class="switch-row">Reduce interface motion <input type="checkbox" id="reduceMotion" ${p.reducedMotion?'checked':''}></label></section><section class="settings-card"><h3>Backup & restore</h3><p>Export everything into one JSON backup, including attachments. Restore it later on another device.</p><div class="setting-button-row"><button class="secondary-button" data-action="backup">${ico('download',16)} Download backup</button><label class="secondary-button file-label">${ico('upload',16)} Restore backup<input type="file" id="restoreFile" accept=".json,application/json" /></label></div><p class="setting-detail">Restoring replaces the current local library. A confirmation will be shown.</p></section><section class="settings-card"><h3>Your boards</h3><p>Export either corkboard to a PNG image, or reset a board to its default zoom and position.</p><div class="setting-button-row"><button class="secondary-button" data-action="export-todo">${ico('image-down',15)} To-do PNG</button><button class="secondary-button" data-action="export-ideas">${ico('image-down',15)} Ideas PNG</button></div><div class="setting-button-row" style="margin-top:10px"><button class="secondary-button" data-action="reset-boards">${ico('rotate-ccw',15)} Reset board views</button></div></section><section class="settings-card"><h3>Reminders & privacy</h3><p>${androidNotificationsAvailable()?'Scheduled reminders use native Android notifications.':'Reminders are stored locally. Native notifications are available when installed through Capacitor on Android.'} IdeaVault uses no cloud service, analytics, or account.</p><button class="secondary-button" data-action="test-reminders">${ico('clock',15)} ${androidNotificationsAvailable()?'Check notification permission':'How notifications work'}</button><p class="setting-detail">The OS may delay non-exact notifications while the device sleeps.</p></section><section class="settings-card"><h3>Take a tour</h3><p>A quick reminder of shortcuts, connecting pins, and managing notes.</p><button class="secondary-button" data-action="help">${ico('circle-help',15)} Show tutorial</button></section><section class="settings-card"><h3>Undo & redo</h3><p>Roll back your recent changes to notes, board positions, and strings.</p><div class="setting-button-row"><button class="secondary-button" data-action="undo">${ico('undo-2',15)} Undo</button><button class="secondary-button" data-action="redo">${ico('redo-2',15)} Redo</button></div></section></div>`;}
+}
+async function doBackup(){try{await flushSaves();const attachments=await db.getAll('attachments');const serialized=[];for(const f of attachments)serialized.push({...f,blobBase64:await db.blobToBase64(f.blob),blob:undefined});const data={format:'IdeaVault',version:1,exportedAt:nowIso(),notes:state.notes,links:state.links,boards:state.boards,preferences:[{key:'settings',value:state.preferences}],attachments:serialized};downloadBlob(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}),`IdeaVault-backup-${new Date().toISOString().slice(0,10)}.json`);toast('Complete offline backup downloaded.');}catch(e){saveError(e);}}
+async function doRestore(file){if(file.size>220*1024*1024){toast('Backup is too large to open on this device.',true);return;}try{const data=JSON.parse(await file.text());if(data.format!=='IdeaVault'||data.version!==1||!Array.isArray(data.notes)||!Array.isArray(data.links)||!Array.isArray(data.boards)||!Array.isArray(data.attachments)||!Array.isArray(data.preferences))throw new Error('Not a supported IdeaVault backup.');if(data.notes.length>25000||data.links.length>75000||data.attachments.length>20000)throw new Error('Backup exceeds safety limits.');for(const n of data.notes)if(typeof n.id!=='string'||!['todo','ideas'].includes(n.boardId))throw new Error('Backup contains invalid notes.');for(const b of data.boards)if(!['todo','ideas'].includes(b.id))throw new Error('Backup has an unknown board.');const proceed=await confirmDialog('Replace all local notes?','The backup will replace both boards, archives, strings and attachments on this device. Download a backup of current work first.');if(!proceed)return;for(const n of data.notes)delete n.sectionId;data.sections=[];const savedSettings=data.preferences.find(x=>x.key==='settings');if(savedSettings?.value)delete savedSettings.value.sectionConsentV4;const attachmentRows=data.attachments.map(f=>({id:f.id,noteId:f.noteId,name:f.name,type:f.type,size:f.size,createdAt:f.createdAt,blob:db.base64ToBlob(f.blobBase64,f.type)}));await db.restoreAll({...data,attachments:attachmentRows});for(const url of attachmentUrls.values())URL.revokeObjectURL(url);attachmentUrls.clear();state.notes=data.notes;state.links=data.links;state.boards=data.boards;for(const n of data.notes)ensureWorldSpace(n.x,n.y,n.w,n.h);state.preferences=data.preferences.find(x=>x.key==='settings')?.value||state.preferences;await savePrefs();state.undo=[];state.redo=[];applyTheme();state.view='todo';closeModal();renderMain();await resetReminders(state.notes);toast('Backup restored successfully.');}catch(e){saveError(e);toast(`Restore failed: ${e.message}`,true);}}
+async function doExport(boardId){try{const blob=await exportPng(visibleNotes(boardId),visibleLinks(boardId),boardTitle(boardId));downloadBlob(blob,`IdeaVault-${boardId}-${new Date().toISOString().slice(0,10)}.png`);toast('Corkboard PNG exported.');}catch(e){console.error(e);toast('PNG export failed on this device. Try again from a desktop browser.',true);}}
+function applyTheme(){document.body.classList.toggle('dark',state.preferences.theme==='dark');document.body.classList.toggle('reduced-motion',!!state.preferences.reducedMotion);}
+function showTutorial(){const el=document.createElement('div');el.className='modal-overlay dialog';el.id='tutorialOverlay';el.innerHTML=`<div class="welcome-panel" role="dialog" aria-modal="true" aria-label="Welcome to IdeaVault"><div class="welcome-illustration"><i></i><i></i></div><div class="topbar-kicker">WELCOME TO YOUR CREATIVE SPACE</div><h2>Beautifully messy ideas<br/>belong here.</h2><p>Arrange your notes like a real corkboard. Connect the thoughts that go together, and make room for what comes next.</p><div class="tutorial-steps"><div><b>1</b> Tap <strong>+ Add note</strong> or double-tap empty cork.</div><div><b>2</b> Drag sticky notes wherever they feel right.</div><div><b>3</b> Select <strong>Connect</strong>, then tap two thumbtacks.</div><div><b>4</b> Tap a note, choose Edit, then use the toolbar to attach files or make checklists.</div></div><button class="primary-button" id="dismissTutorial">Start creating ${ico('chevron-right',17)}</button></div>`;document.body.append(el);el.querySelector('#dismissTutorial').onclick=()=>{el.remove();state.preferences.onboarded=true;savePrefs();};}
+function boardMenu(){const el=document.createElement('div');el.className='modal-overlay dialog';el.id='menuOverlay';el.innerHTML=`<div class="menu-panel" role="dialog" aria-modal="true"><h3>Board actions</h3><button data-menu-action="add-note">${ico('plus',18)}Add a new note</button><button data-menu-action="export-png">${ico('image-down',18)}Export board as PNG</button><button data-menu-action="undo">${ico('undo-2',18)}Undo last change</button><button data-menu-action="redo">${ico('redo-2',18)}Redo change</button><button data-menu-action="reset-view">${ico('rotate-ccw',18)}Reset zoom & position</button><button data-menu-action="help">${ico('circle-help',18)}See how it works</button><button data-menu-action="cancel">${ico('x',18)}Close menu</button></div>`;document.body.append(el);el.addEventListener('click',e=>{if(e.target===el){el.remove();return;}const btn=e.target.closest('[data-menu-action]');if(btn){el.remove();handleAction(btn.dataset.menuAction);}});}
+async function noteMenu(id){const n=noteById(id);if(!n)return;const el=document.createElement('div');el.className='modal-overlay dialog';el.innerHTML=`<div class="menu-panel" role="dialog" aria-modal="true"><h3>${escape(n.title)}</h3><button data-op="preview">${ico('eye',17)}Read note</button><button data-op="edit">${ico('edit-3',17)}Edit note</button><button data-op="duplicate">${ico('copy',17)}Duplicate</button><button data-op="${n.locked?'unlock':'lock'}">${ico(n.locked?'unlock':'lock',17)}${n.locked?'Unlock':'Lock'} position</button><button data-op="${n.pinned?'unpin':'pin'}">${ico('pin',17)}${n.pinned?'Unpin':'Pin'} on board</button><button data-op="archive">${ico('archive',17)}Archive</button><button data-op="delete">${ico('trash-2',17)}Move to trash</button></div>`;document.body.append(el);el.addEventListener('click',e=>{if(e.target===el){el.remove();return;}const btn=e.target.closest('[data-op]');if(!btn)return;el.remove();const op=btn.dataset.op;if(op==='edit')openDetail(id);else if(op==='preview')openPreview(id);else noteOperation(op==='unlock'?'lock':op==='unpin'?'pin':op,id);});}
+async function handleAction(action){switch(action){case 'help':showTutorial();break;case 'add-note':addNoteCenter();break;case 'cancel-connect':changeTool('select');break;case 'board-menu':boardMenu();break;case 'zoom-out':setZoom(board().zoom/1.18);break;case 'zoom-in':setZoom(board().zoom*1.18);break;case 'reset-view':if(!board())return;board().zoom=1;board().ox=12;board().oy=3;updateTransform();saveBoard();toast('Board view reset.');break;case 'undo':await undo();break;case 'redo':await redo();break;case 'export-png':await doExport(state.view);break;case 'export-todo':await doExport('todo');break;case 'export-ideas':await doExport('ideas');break;case 'backup':await doBackup();break;case 'reset-boards':state.boards=defaultBoards();for(const b of state.boards)db.put('boards',b).catch(saveError);toast('Board views reset.');break;case 'test-reminders':if(!androidNotificationsAvailable()){toast('Native Android notifications are enabled in the installed APK.');return;}try{const n=await import('./native.js');const result=await n.configureNotifications();toast(result?'Notification permission enabled.':'Notifications are disabled in Android settings.',!result);}catch(e){toast(`Notifications unavailable: ${e.message}`,true);}break;case 'close-modal':closeModal();break;case 'jump-to-content':$('#editorContentHeading')?.scrollIntoView({behavior:'smooth',block:'start'});$('#richEditor')?.focus({preventScroll:true});break;case 'edit-from-preview':if(state.detailId)openDetail(state.detailId,'details');break;case 'open-note-link':{const n=noteById(state.detailId);if(!n?.externalLink)return;try{const url=new URL(n.externalLink);if(!['http:','https:'].includes(url.protocol))throw new Error('Unsupported link');window.open(url.href,'_blank','noopener,noreferrer');}catch(e){toast('Please enter a valid http(s) link.',true);}break;}}
+}
+// Tap and drag individual sticky notes; gestures and SVG strings use the same world coordinate space.
+function beginNoteResize(e,card,handle){if(!card||state.tool!=='select')return;const n=noteById(card.dataset.noteId);if(!n)return;e.preventDefault();e.stopPropagation();if(n.locked){toast('Unlock note to resize.');return;}handle.setPointerCapture(e.pointerId);const startX=e.clientX,startY=e.clientY,originalW=n.w,originalH=n.h;let changed=false;
+ function move(ev){if(ev.pointerId!==e.pointerId)return;const dx=(ev.clientX-startX)/board().zoom,dy=(ev.clientY-startY)/board().zoom;
+  if(!changed&&Math.hypot(dx,dy)>3){history();changed=true;}
+  if(!changed)return;n.w=clamp(Math.round(originalW+dx),190,1300);n.h=clamp(Math.round(originalH+dy),160,1800);
+  if(ensureWorldSpace(n.x,n.y,n.w,n.h))updateWorldDimensions();card.style.width=`${n.w}px`;card.style.height=`${n.h}px`;renderStringsFor(n.id);
+ }
+ function finish(){handle.removeEventListener('pointermove',move);handle.removeEventListener('pointerup',finish);handle.removeEventListener('pointercancel',finish);try{handle.releasePointerCapture(e.pointerId);}catch{}if(changed){n.updatedAt=nowIso();saveNote(n);renderBoard();}}
+ handle.addEventListener('pointermove',move);handle.addEventListener('pointerup',finish);handle.addEventListener('pointercancel',finish);
+}
+notesLayer.addEventListener('pointerdown',e=>{
+ const card=e.target.closest('[data-note-id]');if(!card)return;
+ if(e.target.closest('[data-note-resize]')){beginNoteResize(e,e.target.closest('[data-note-id]'),e.target.closest('[data-note-resize]'));return;}
+ if(e.target.closest('button,input'))return;
+ if(e.button!==0&&e.pointerType==='mouse')return;
+ const n=noteById(card.dataset.noteId);if(!n)return;
+ e.stopPropagation();
+ if(state.tool==='pan')return;
+ if(state.tool==='connect')return;
+ let startX=e.clientX,startY=e.clientY,origX=n.x,origY=n.y,moved=false,longTimer=null,longTriggered=false;
+ card.setPointerCapture(e.pointerId);
+ if(e.pointerType!=='mouse')longTimer=setTimeout(()=>{if(!moved){longTriggered=true;noteMenu(n.id);}},630);
+ function move(ev){if(ev.pointerId!==e.pointerId||longTriggered)return;const dx=ev.clientX-startX,dy=ev.clientY-startY;if(!moved&&Math.hypot(dx,dy)>6){moved=true;clearTimeout(longTimer);if(n.locked){toast('Unlock this note to move it.');finish(ev);return;}history();card.classList.add('dragging');}if(moved&&!n.locked){const nextX=Math.max(0,Math.round(origX+dx/board().zoom)),nextY=Math.max(0,Math.round(origY+dy/board().zoom));if(ensureWorldSpace(nextX,nextY,n.w,n.h))updateWorldDimensions();n.x=clamp(nextX,0,WORLD_W-n.w);n.y=clamp(nextY,0,WORLD_H-n.h);card.style.left=`${n.x}px`;card.style.top=`${n.y}px`;renderStringsFor(n.id);}}
+ async function finish(ev){if(ev.pointerId!==e.pointerId)return;clearTimeout(longTimer);card.removeEventListener('pointermove',move);card.removeEventListener('pointerup',finish);card.removeEventListener('pointercancel',finish);try{card.releasePointerCapture(e.pointerId);}catch{}if(moved&&!n.locked){card.classList.remove('dragging');n.updatedAt=nowIso();await saveNote(n);renderBoard();}else if(!longTriggered&&!moved){openPreview(n.id);}}
+ card.addEventListener('pointermove',move);card.addEventListener('pointerup',finish);card.addEventListener('pointercancel',finish);
+});
+notesLayer.addEventListener('click',e=>{const pin=e.target.closest('[data-pin]');if(pin){e.stopPropagation();selectPin(pin.dataset.pin);return;}const menu=e.target.closest('[data-note-menu]');if(menu){e.stopPropagation();noteMenu(menu.dataset.noteMenu);return;}const comp=e.target.closest('[data-note-complete]');if(comp){e.stopPropagation();noteOperation('complete',comp.dataset.noteComplete);}});
+notesLayer.addEventListener('keydown',e=>{const card=e.target.closest('[data-note-id]');if(card&&e.target===card&&(e.key==='Enter'||e.key===' ')){e.preventDefault();openPreview(card.dataset.noteId);}});
+stringsLayer.addEventListener('click',e=>{const path=e.target.closest('[data-link]');if(path){e.stopPropagation();deleteLink(path.dataset.link);}});
+// Board gesture: pan one pointer and pinch zoom using two pointers; move notes only via note handlers.
+const pointers=new Map();
+viewport.addEventListener('pointerdown',e=>{if(e.target.closest('.note,[data-link],button,.empty-board'))return;if(e.button!==0&&e.pointerType==='mouse')return;pointers.set(e.pointerId,{x:e.clientX,y:e.clientY,startX:e.clientX,startY:e.clientY});viewport.setPointerCapture(e.pointerId);if(pointers.size===1){activeBoardGesture={baseX:board().ox,baseY:board().oy,startX:e.clientX,startY:e.clientY,moved:false};}else if(pointers.size===2){const a=[...pointers.values()];const rect=viewport.getBoundingClientRect();activeBoardGesture={pinch:true,zoom:board().zoom,dist:Math.hypot(a[0].x-a[1].x,a[0].y-a[1].y),mid:{x:(a[0].x+a[1].x)/2,y:(a[0].y+a[1].y)/2},baseX:board().ox,baseY:board().oy,rect};}
+});
+viewport.addEventListener('pointermove',e=>{if(!pointers.has(e.pointerId))return;const p=pointers.get(e.pointerId);p.x=e.clientX;p.y=e.clientY;if(pointers.size===2){const ps=[...pointers.values()];let g=activeBoardGesture;if(!g?.pinch)return;const dist=Math.hypot(ps[0].x-ps[1].x,ps[0].y-ps[1].y);const midX=(ps[0].x+ps[1].x)/2,midY=(ps[0].y+ps[1].y)/2;const oldZ=g.zoom;const z=clamp(g.zoom*dist/Math.max(1,g.dist),.35,2.25);const rect=g.rect;const wx=(g.mid.x-rect.left-g.baseX)/oldZ,wy=(g.mid.y-rect.top-g.baseY)/oldZ;board().zoom=z;board().ox=midX-rect.left-wx*z;board().oy=midY-rect.top-wy*z;updateTransform();return;}if(!activeBoardGesture?.pinch&&pointers.size===1){const deltaX=e.clientX-p.startX,deltaY=e.clientY-p.startY;if(Math.hypot(deltaX,deltaY)>4)activeBoardGesture.moved=true;board().ox=activeBoardGesture.baseX+deltaX;board().oy=activeBoardGesture.baseY+deltaY;updateTransform();}});
+function endBoardPointer(e){if(!pointers.has(e.pointerId))return;const p=pointers.get(e.pointerId),wasPinch=!!activeBoardGesture?.pinch,wasMoved=!!activeBoardGesture?.moved;pointers.delete(e.pointerId);if(viewport.hasPointerCapture?.(e.pointerId))viewport.releasePointerCapture(e.pointerId);if(!pointers.size){if(!wasPinch&&!wasMoved&&e.pointerType==='touch'){const tap={x:e.clientX,y:e.clientY,time:Date.now()};if(lastTap&&tap.time-lastTap.time<330&&Math.hypot(tap.x-lastTap.x,tap.y-lastTap.y)<24){const r=viewport.getBoundingClientRect(),pos=worldPoint(tap.x,tap.y,r,board());addNoteAt(pos.x-121,pos.y-116);lastTap=null;}else lastTap=tap;}activeBoardGesture=null;clearTimeout(viewSaveTimer);viewSaveTimer=setTimeout(saveBoard,250);}else if(pointers.size===1){const remain=[...pointers.values()][0];activeBoardGesture={baseX:board().ox,baseY:board().oy,startX:remain.x,startY:remain.y,moved:true};remain.startX=remain.x;remain.startY=remain.y;}}
+viewport.addEventListener('pointerup',endBoardPointer);viewport.addEventListener('pointercancel',endBoardPointer);
+viewport.addEventListener('wheel',e=>{e.preventDefault();setZoom(board().zoom*Math.exp(-e.deltaY*.0012),e.clientX,e.clientY);},{passive:false});
+viewport.addEventListener('dblclick',e=>{if(e.target.closest('.note,[data-link],button,.empty-board'))return;const r=viewport.getBoundingClientRect(),pos=worldPoint(e.clientX,e.clientY,r,board());addNoteAt(pos.x-121,pos.y-116);});
+// Global delegated navigation and controls.
+document.addEventListener('click',async e=>{const contentTool=e.target.closest('[data-content-tool]');if(contentTool){toggleContentTool(contentTool.dataset.contentTool);return;}const editTab=e.target.closest('[data-edit-tab]');if(editTab){if(state.detailId)openDetail(state.detailId,editTab.dataset.editTab);return;}const format=e.target.closest('[data-format]');if(format){formatSelectedRich(format.dataset.format);return;}const choiceRemove=e.target.closest('[data-choice-remove]');if(choiceRemove){const n=noteById(state.detailId);if(!n)return;startEditHistory();n.choices=(n.choices||[]).filter(x=>x.id!==choiceRemove.dataset.choiceRemove);if(n.selectedChoiceId===choiceRemove.dataset.choiceRemove)n.selectedChoiceId='';markEdited(n);openDetail(n.id,'content');return;}const nav=e.target.closest('[data-nav]');if(nav){changeView(nav.dataset.nav);return;}const tool=e.target.closest('[data-tool]');if(tool){changeTool(tool.dataset.tool);return;}const a=e.target.closest('[data-action]');if(a){await handleAction(a.dataset.action);return;}const color=e.target.closest('[data-color]');if(color){const n=noteById(state.detailId);if(!n)return;startEditHistory();n.color=color.dataset.color;markEdited(n);document.querySelectorAll('[data-color]').forEach(x=>x.classList.toggle('active',x===color));renderSingleNote(n);return;}const op=e.target.closest('[data-note-operation]');if(op){await noteOperation(op.dataset.noteOperation);return;}const x=e.target.closest('[data-check-remove]');if(x){const n=noteById(state.detailId);if(!n)return;startEditHistory();n.checklist=n.checklist.filter(c=>c.id!==x.dataset.checkRemove);markEdited(n);openDetail(n.id,'content');renderSingleNote(n);return;}const restore=e.target.closest('[data-restore]');if(restore){await restoreNote(restore.dataset.restore);return;}const forever=e.target.closest('[data-perma-delete]');if(forever){await permanentlyDeleteNote(forever.dataset.permaDelete);return;}const jump=e.target.closest('[data-jump]');if(jump){focusNote(jump.dataset.jump);return;}const tab=e.target.closest('[data-archive-tab]');if(tab){state.archiveTab=tab.dataset.archiveTab;renderList();return;}const fileBtn=e.target.closest('[data-file-download]');if(fileBtn){const f=await db.getOne('attachments',fileBtn.dataset.fileDownload);if(f)downloadBlob(f.blob,f.name);return;}const removeFile=e.target.closest('[data-file-remove]');if(removeFile){deleteFile(removeFile.dataset.fileRemove);return;}});
+document.addEventListener('input',e=>{if(e.target.id==='richEditor'){saveRichFromEditor();return;}if(e.target.id==='searchInput'){state.query=e.target.value;renderSearchResults();return;}if(e.target.dataset.edit){if(['due','reminder','priority','size'].includes(e.target.dataset.edit))return;handleEdit(e.target);}const choice=e.target.dataset.choiceText;if(choice){const n=noteById(state.detailId);const item=n?.choices?.find(x=>x.id===choice);if(item){startEditHistory();item.text=e.target.value;markEdited(n);}return;}const text=e.target.dataset.checkText;if(text){const n=noteById(state.detailId);if(n){const item=n.checklist.find(i=>i.id===text);if(item){startEditHistory();item.text=e.target.value;markEdited(n);}}}});
+document.addEventListener('change',async e=>{if(e.target.dataset.edit||e.target.dataset.editCheck){handleEdit(e.target);return;}if(e.target.dataset.choiceToggle){const n=noteById(state.detailId);if(n){startEditHistory();n.selectedChoiceId=e.target.dataset.choiceToggle;markEdited(n);}return;}if(e.target.id==='richFont'){formatSelectedRich('font-family',e.target.value);return;}if(e.target.id==='richSize'){formatSelectedRich('font-size',e.target.value);return;}if(e.target.id==='richColor'){formatSelectedRich('color',e.target.value);return;}if(e.target.dataset.checkToggle){const n=noteById(state.detailId);const item=n?.checklist.find(i=>i.id===e.target.dataset.checkToggle);if(item){startEditHistory();item.done=e.target.checked;markEdited(n);renderSingleNote(n);}return;}if(e.target.id==='attachmentInput'){await handleAttachmentFiles([...e.target.files]);e.target.value='';return;}if(e.target.id==='restoreFile'){const file=e.target.files?.[0];if(file)await doRestore(file);e.target.value='';return;}if(e.target.name==='theme'){state.preferences.theme=e.target.value;applyTheme();savePrefs();return;}if(e.target.id==='reduceMotion'){state.preferences.reducedMotion=e.target.checked;applyTheme();savePrefs();return;}if(e.target.matches('#filterBoard,#filterColor,#filterPriority,#filterStatus,#filterDate'))renderSearchResults();});
+document.addEventListener('submit',e=>{if(e.target.id==='newChecklistForm'){e.preventDefault();const n=noteById(state.detailId);const input=$('#newCheckText');if(!n||!input.value.trim())return;startEditHistory();n.checklist.push({id:uid(),text:input.value.trim(),done:false});markEdited(n);openDetail(n.id,'content');renderSingleNote(n);}if(e.target.id==='newChoiceForm'){e.preventDefault();const n=noteById(state.detailId),input=$('#newChoiceText');if(!n||!input?.value.trim())return;startEditHistory();(n.choices||=[]).push({id:uid(),text:input.value.trim()});markEdited(n);openDetail(n.id,'content');}});
+document.addEventListener('keydown',e=>{const result=e.target.closest?.('[data-jump]');if(result&&(e.key==='Enter'||e.key===' ')){e.preventDefault();focusNote(result.dataset.jump);return;}if(e.key==='Escape'){const overlay=document.querySelector('#tutorialOverlay,#menuOverlay');if(overlay){overlay.remove();return;}if($('#confirmOverlay'))return;closeModal();if(state.tool==='connect')changeTool('select');return;}const tag=e.target.tagName.toLowerCase();if(['input','textarea','select'].includes(tag)||e.target.isContentEditable)return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'){e.preventDefault();if(e.shiftKey)redo();else undo();}if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='y'){e.preventDefault();redo();}if(e.key.toLowerCase()==='n'&&['todo','ideas'].includes(state.view)){e.preventDefault();addNoteCenter();}});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')flushSaves().catch(saveError);});
+window.addEventListener('beforeunload',()=>{for(const t of saveTimers.values())clearTimeout(t);});
+function seedDemo(){const todo=[createNote('todo',89,95,'Plan the week','butter'),createNote('todo',392,120,'Finish the little things','rose'),createNote('todo',215,397,'Read 20 pages','sage'),createNote('todo',655,335,'Weekend reset','sky')];todo[0].description='Make space for what matters most. Start with the essentials.';todo[0].checklist=[{id:uid(),text:'Pick three priorities',done:true},{id:uid(),text:'Block time to focus',done:false}];todo[0].priority='high';todo[1].description='Send that email. Tidy the desk. One thing at a time.';todo[2].description='A little daily reading adds up. Make it a ritual.';todo[3].description='Slow mornings, clean spaces, fresh starts.';const idea=[createNote('ideas',92,103,'A tiny coffee shop','butter'),createNote('ideas',399,135,'Stories worth telling','rose'),createNote('ideas',234,385,'Make a moodboard','lilac'),createNote('ideas',677,361,'Build something new','sage')];idea[0].description='A creative space filled with books, plants and warm light.';idea[1].description='A notebook of characters, moments and little mysteries.';idea[2].description='Colors, shapes, textures. Collect inspiration before it disappears.';idea[3].description='What if ideas could connect like constellations?';state.notes=[...todo,...idea];state.links=[{id:uid(),boardId:'todo',from:todo[0].id,to:todo[1].id,kind:'dependency',createdAt:nowIso()},{id:uid(),boardId:'ideas',from:idea[0].id,to:idea[2].id,kind:'related',createdAt:nowIso()},{id:uid(),boardId:'ideas',from:idea[2].id,to:idea[3].id,kind:'related',createdAt:nowIso()}];}
+async function init(){try{injectIcons();$('#datePill').textContent=new Date().toLocaleDateString(undefined,{weekday:'short',month:'short',day:'numeric',year:'numeric'});const [notes,links,boards,prefs]=await Promise.all([db.getAll('notes'),db.getAll('links'),db.getAll('boards'),db.getAll('preferences')]);state.notes=notes;state.links=links;state.boards=boards.length?boards:defaultBoards();for(const n of notes)ensureWorldSpace(n.x,n.y,n.w,n.h);state.preferences=prefs.find(p=>p.key==='settings')?.value||state.preferences;
+ // v6 migration: remove old outlines and memberships, preserving every note,
+ // connection, board position and attachment. Retain the IndexedDB object store
+ // for compatibility with older installations and exported backups.
+ await db.transaction(['sections'],'readwrite',tx=>tx.objectStore('sections').clear());
+ for(const note of state.notes){if('sectionId' in note){delete note.sectionId;await saveNote(note);}}
+ if('sectionConsentV4' in state.preferences){delete state.preferences.sectionConsentV4;await savePrefs();}
+ if(!boards.length){seedDemo();await db.replaceCore(state);}applyTheme();const hash=window.location.hash.replace('#','');state.view=['todo','ideas','search','archive','settings'].includes(hash)?hash:'todo';renderMain();if(!state.preferences.onboarded)showTutorial();}catch(e){console.error(e);$('#boardView').innerHTML=`<div style="padding:30px;background:#fff0ed;color:#783f2c"><h2>IdeaVault couldn't open local storage</h2><p style="margin:12px 0">${escape(e.message)}</p><p>Make sure you're not in private browsing, allow local storage, and open this app through a local server or the installed Android app.</p></div>`;}}
+init();
