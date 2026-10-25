@@ -1,4 +1,3 @@
-
 name: Build IdeaVault Android APK
 
 on:
@@ -12,7 +11,7 @@ permissions:
 jobs:
   build-debug-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
 
     steps:
       - name: Check out the project
@@ -29,13 +28,27 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install Android SDK tools
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK platform
+      # GitHub's Ubuntu runners already contain the Android SDK.
+      # Avoid setup-android@v3, whose older cmdline-tools download/license
+      # stage failed on the user's hosted runner before the app was built.
+      - name: Configure the preinstalled Android SDK
+        shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "SDK root: $SDK_ROOT"
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Android sdkmanager was not found at $SDKMANAGER"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          "$SDKMANAGER" --version
+          if [ ! -d "$SDK_ROOT/platforms/android-36" ] || [ ! -d "$SDK_ROOT/build-tools/36.0.0" ]; then
+            "$SDKMANAGER" --install 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
+          else
+            echo "Android API 36 and Build Tools 36.0.0 are already installed."
+          fi
 
       - name: Install JavaScript dependencies
         run: npm install --no-audit --no-fund
@@ -58,7 +71,7 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
-      - name: Upload Android APK
+      - name: Upload installable debug APK
         uses: actions/upload-artifact@v4
         with:
           name: IdeaVault-Android-Debug-APK
