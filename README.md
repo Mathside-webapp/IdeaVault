@@ -119,3 +119,8 @@ tools/                      Offline preview builder + Android patch
 The former section/outline feature has been removed from both boards, including the Section button, outlines, resize handles, titles, membership prompts and section movement logic. Existing notes and their positions, red strings and attachments remain intact. On upgrading, leftover section membership and outline records are cleared. Older backups still restore note contents and connections without recreating sections.
 
 The centered Note Details and Content editor, rich text, checklists, radio choices, paperclip attachments, note resizing, cork textures and navigation animations remain available.
+
+
+## GitHub Actions Vite CSS build fix
+
+This release removes the invalid placeholder `@import url('data:text/css,');` from `src/style.css`. That line made Vite/PostCSS try to open `data:text/css,` as a local file and caused `npm run build` to fail. Upload **all project files**, retaining the `.github/workflows/build-android.yml` folder. The corrected workflow uses the preinstalled Android SDK. After uploading, run Actions > Build IdeaVault Android APK > Run workflow. An APK is available in the workflow Artifacts only if all steps succeed.
